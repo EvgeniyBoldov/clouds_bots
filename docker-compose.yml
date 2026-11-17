@@ -1,0 +1,27 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: gateway
+      POSTGRES_USER: gateway
+      POSTGRES_PASSWORD: gateway
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gateway"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+  app:
+    build: .
+    env_file: .env
+    depends_on:
+      postgres: {condition: service_healthy}
+    restart: unless-stopped
+  nginx:
+    image: nginx:1.27-alpine
+    ports: ["${GATEWAY_HTTP_PORT:-80}:80"]
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on: [app]
+    restart: unless-stopped
+volumes: {pgdata: {}}
