@@ -15,6 +15,10 @@ class Bot(Base):
     name: Mapped[str] = mapped_column(String(200))
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     default_handler: Mapped[str] = mapped_column(String(100), default="echo")
+    template_id: Mapped[str] = mapped_column(String(64), default="echo", server_default="echo")
+    cts_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    secret_key: Mapped[str | None] = mapped_column(Text, nullable=True)
+    credential_revision: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -60,6 +64,9 @@ class UserGrant(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     bot_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("bots.id"))
     user_id: Mapped[str] = mapped_column(String(200))
+    identity_type: Mapped[str] = mapped_column(String(16), default="huid", server_default="huid")
+    identity_value: Mapped[str | None] = mapped_column(String(320), nullable=True)
+    ad_domain: Mapped[str | None] = mapped_column(String(255), nullable=True)
     permission: Mapped[str] = mapped_column(String(100), default="use")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     __table_args__ = (UniqueConstraint("bot_id", "user_id", "permission"),)
