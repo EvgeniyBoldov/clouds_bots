@@ -35,7 +35,7 @@ def test_echo_template_catalog_and_commands():
 
     assert asyncio.run(EchoBot().dispatch(request("/ping", "/ping"))).text == "pong"
     assert "Доступные команды" in asyncio.run(EchoBot().dispatch(request("/help", "/help"))).text
-    assert asyncio.run(EchoBot().dispatch(request("hello"))).text == "hello"
+    assert asyncio.run(EchoBot().dispatch(request("hello"))).text is None
 
 
 def test_command_inheritance_and_override_by_command_name():

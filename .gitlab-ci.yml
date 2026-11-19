@@ -1,0 +1,52 @@
+stages:
+  - test
+  - deploy
+
+test_service:
+  stage: test
+  tags: [production-shell]
+  script:
+    - bash -n scripts/release.sh scripts/release-common.sh scripts/deploy.sh scripts/production-controller.sh
+    - bash -c 'source scripts/release-common.sh; load_release_file release.env bootstrap'
+    - python3 -m unittest discover -s scripts/tests -q
+  rules:
+    - if: '$CI_COMMIT_BRANCH'
+
+deploy_production:
+  stage: deploy
+  tags:
+    - production-shell
+  resource_group: clouds-bots-production
+  needs: [test_service]
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      changes:
+        - release.env
+        - infra/compose/gateway.compose.yaml
+        - scripts/deploy-production.sh
+        - scripts/release-common.sh
+        - scripts/deploy.sh
+        - scripts/production-controller.sh
+  script:
+    - test -f release.env
+    - test -f infra/compose/gateway.compose.yaml
+    - if grep -q "^RELEASE_COMMIT=$" release.env; then echo "Bootstrap manifest: nothing to deploy"; else bash scripts/deploy-production.sh; fi
+  environment:
+    name: production
+  after_script:
+    - sudo --non-interactive /usr/local/sbin/clouds-bots-deploy status > deployment-status.env || true
+  artifacts:
+    when: always
+    paths: [deployment-status.env]
+
+rollback_production:
+  stage: deploy
+  tags: [production-shell]
+  resource_group: clouds-bots-production
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      when: manual
+  script:
+    - sudo --non-interactive /usr/local/sbin/clouds-bots-deploy rollback
+  environment:
+    name: production

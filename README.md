@@ -15,7 +15,7 @@ Open `/` for the admin page and sign in with `GATEWAY_ADMIN_TOKEN`. The admin pa
 
 ## pybotx integration status
 
-`src/gateway/bot.py` uses pybotx's `BotAccountProvider` snapshot so newly registered credentials apply without restarting the process. It persists authorized personal messages, deduplicates events, answers personal chats, and answers group messages only when a structured contact mention or slash command is present. Group calls are open to all users. Use `allowed_data=all` in eXpress admin.
+`src/gateway/bot.py` uses pybotx's `BotAccountProvider` snapshot so newly registered credentials apply without restarting the process. It persists authorized personal messages, deduplicates events, answers personal chats, and routes group messages to the selected template, with default replies for structured contact mentions, replies to the bot, and slash commands. Group calls are open to all users. Use `allowed_data=all` in eXpress admin.
 
 The main app mounts the documented pybotx routes and runs a PostgreSQL polling worker that sends queued notification messages via `Bot.send_message`. `gateway.bot` supplies the shared collector and Bot instance.
 
@@ -54,3 +54,7 @@ Commands inherit from base classes. A decorated method with the same command nam
 ## Permissions
 
 The admin UI grants a user `use` access per bot. Email addresses resolve through BotX to the user's stable HUID; an AD account must include both AD login and AD domain; HUID can also be provided directly. Personal messages are accepted only from users with a matching grant. Group invocation policy remains open by design per the project requirement. Never expose the admin API directly without a strong token and TLS.
+
+Production release and deployment instructions: [docs/deployment.md](docs/deployment.md).
+
+Group message delivery depends on the eXpress bot card: add the bot to the chat and set the available message types (`allowed_data`) to `all`. The gateway stores received group messages when chat history is enabled. Templates can override `on_group_message` to inspect ordinary group messages (it returns nothing by default), `on_mention` for structured bot mentions, and `on_reply` for replies whose `reply.author_id` matches the bot ID; decorated commands take priority. `HandlerRequest.metadata` contains `is_mentioned`, `is_reply_to_bot`, and the reply's author, message ID and body. Direct messages continue to use `on_message`. The platform only delivers messages permitted by its bot settings; it does not provide earlier chat history through this handler.

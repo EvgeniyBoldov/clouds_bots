@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+
+# Install as /usr/local/sbin/clouds-bots-deploy, root:root, mode 0750.
+set -Eeuo pipefail
+CONFIG_FILE="/etc/clouds-bots/controller.env"
+log() { printf '[clouds-bots-controller %s] %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$*" >&2; }
+fail() { log "ERROR: $*"; exit 1; }
+test "$EUID" -eq 0 || fail "Controller must run as root"; test -r "$CONFIG_FILE" || fail "Missing controller configuration: $CONFIG_FILE"; test "$(stat -c '%U:%G:%a' "$CONFIG_FILE")" = "root:root:600" || fail "Controller configuration must be root:root mode 0600"; source "$CONFIG_FILE"
+: "${APP_ROOT:=/opt/clouds-bots}"; : "${ETC_ROOT:=/etc/clouds-bots}"; : "${CI_BUILDS_ROOT:?CI_BUILDS_ROOT is required in controller.env}"
+HELPER="${APP_ROOT}/current/scripts/deploy.sh"
+usage() { echo "Usage: clouds-bots-deploy deploy --source CI_CHECKOUT --release SHA | rollback | status" >&2; exit 2; }
+set_current() { local target="$1" tmp="${APP_ROOT}/.current.$$.new"; ln -s "$target" "$tmp"; mv -Tf "$tmp" "$APP_ROOT/current"; }
+safe_source() { local source root; source="$(realpath -e "$1")" || fail "CI checkout is missing"; root="$(realpath -e "$CI_BUILDS_ROOT")" || fail "CI_BUILDS_ROOT is missing"; case "$source" in "$root"/*) printf '%s\n' "$source" ;; *) fail "CI source must be inside CI_BUILDS_ROOT" ;; esac; }
+stage() {
+  local source="$1" id="$2" dest tmp file version
+  version="$(sed -n 's/^RELEASE_VERSION=//p' "$source/release.env")"
+  [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "Release version must be X.Y.Z"
+  dest="${APP_ROOT}/releases/${version}"
+  if [[ -e "$dest" ]]; then
+    [[ -f "$dest/.release-id" && "$(<"$dest/.release-id")" == "$id" ]] || fail "Invalid existing release: $dest"
+    for file in release.env compose.yaml scripts/release-common.sh scripts/deploy.sh; do
+      [[ -f "$dest/$file" && -r "$dest/$file" ]] || fail "Existing release bundle is incomplete: $dest/$file"
+    done
+    cmp -s "$source/release.env" "$dest/release.env" || fail "Existing release manifest differs from CI source: $dest/release.env"
+    echo "$dest"
+    return
+  fi
+  for file in release.env infra/compose/gateway.compose.yaml scripts/release-common.sh scripts/deploy.sh; do [[ -f "$source/$file" ]] || fail "Release bundle is missing $file"; done
+  tmp="$(mktemp -d "${APP_ROOT}/releases/.${id}.XXXXXX")"; trap 'rm -rf "${tmp:-}"' RETURN
+  install -D -o root -m 0640 "$source/release.env" "$tmp/release.env"; install -D -o root -m 0640 "$source/infra/compose/gateway.compose.yaml" "$tmp/compose.yaml"; install -D -o root -m 0640 "$source/scripts/release-common.sh" "$tmp/scripts/release-common.sh"; install -D -o root -m 0750 "$source/scripts/deploy.sh" "$tmp/scripts/deploy.sh"; printf '%s\n' "$id" > "$tmp/.release-id"; chmod 0640 "$tmp/.release-id"; chmod 0750 "$tmp" "$tmp/scripts"; mv "$tmp" "$dest"; trap - RETURN; echo "$dest"
+}
+
+command="${1:-}"; shift || true; mkdir -p "$APP_ROOT/releases"
+case "$command" in
+  deploy) [[ "${1:-}" == --source && -n "${2:-}" && "${3:-}" == --release && -n "${4:-}" ]] || usage; [[ "$4" =~ ^[0-9a-f]{7,64}$ ]] || fail "Release ID must be a Git SHA"; dir="$(stage "$(safe_source "$2")" "$4")"; env CLOUDS_BOTS_APP_ROOT="$APP_ROOT" CLOUDS_BOTS_ETC_ROOT="$ETC_ROOT" bash "$dir/scripts/deploy.sh" deploy --release-dir "$dir"; set_current "$dir" ;;
+
+  rollback) test "$#" -eq 0 || usage; env CLOUDS_BOTS_APP_ROOT="$APP_ROOT" CLOUDS_BOTS_ETC_ROOT="$ETC_ROOT" bash "$HELPER" rollback; active_dir="$(sed -n 's/^ACTIVE_DIR=//p' "$ETC_ROOT/active-release.env" | tail -n 1)"; set_current "$active_dir" ;;
+  status) test "$#" -eq 0 || usage; [[ -x "$HELPER" ]] || { echo ACTIVE_RELEASE=none; exit 0; }; exec env CLOUDS_BOTS_APP_ROOT="$APP_ROOT" CLOUDS_BOTS_ETC_ROOT="$ETC_ROOT" bash "$HELPER" status ;;
+  *) usage;;
+esac

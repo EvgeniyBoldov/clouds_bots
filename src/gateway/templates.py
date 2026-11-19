@@ -74,16 +74,32 @@ class BaseBot:
         """Handle ordinary text or commands not declared by this template."""
         return HandlerResult(text=request.text)
 
+    async def on_group_message(self, request: HandlerRequest) -> HandlerResult | str | None:
+        """Observe other group messages without replying by default."""
+        return None
+
+    async def on_mention(self, request: HandlerRequest) -> HandlerResult | str | None:
+        return await self.on_message(request)
+
+    async def on_reply(self, request: HandlerRequest) -> HandlerResult | str | None:
+        return await self.on_message(request)
+
     async def dispatch(self, request: HandlerRequest) -> HandlerResult:
         command_name = request.command
         if not command_name and request.text.startswith("/"):
             command_name = request.text.split(maxsplit=1)[0]
         command_name = command_name.lower() if command_name else None
         definition = self._commands().get(command_name) if command_name else None
-        if definition is None:
-            result = await self.on_message(request)
-        else:
+        if definition is not None:
             result = await getattr(self, definition.method_name)(request)
+        elif request.chat_type == "group" and request.metadata.get("is_reply_to_bot"):
+            result = await self.on_reply(request)
+        elif request.chat_type == "group" and request.metadata.get("is_mentioned"):
+            result = await self.on_mention(request)
+        elif request.chat_type == "group" and not command_name:
+            result = await self.on_group_message(request)
+        else:
+            result = await self.on_message(request)
         if isinstance(result, HandlerResult):
             return result
         if isinstance(result, str):

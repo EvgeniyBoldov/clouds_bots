@@ -99,6 +99,8 @@ async def incoming_message(message: IncomingMessage, bot: Bot) -> None:
     # IncomingMessage exposes structured mention entities; never infer mentions from plain text.
     mentions = message.mentions
     is_mentioned = any(str(mention.entity_id) == str(bot_id) for mention in getattr(mentions, "contacts", ()))
+    reply = message.reply
+    is_reply_to_bot = bool(reply and str(reply.author_id) == str(bot_id))
     chat_type = str(getattr(message.chat, "type", "unknown")).lower()
     is_group = "group" in chat_type
     from .main import Session
@@ -129,18 +131,21 @@ async def incoming_message(message: IncomingMessage, bot: Bot) -> None:
             return
         session.add(InboundEvent(bot_id=bot_id, message_id=message_id, chat_id=chat_id,
                                  payload={"sender_id": user_id, "body": body, "chat_type": chat_type,
-                                          "is_group": is_group, "is_mentioned": is_mentioned}))
+                                          "is_group": is_group, "is_mentioned": is_mentioned,
+                                          "is_reply_to_bot": is_reply_to_bot}))
         if chat.history_enabled:
             session.add(Message(bot_id=bot_id, chat_id=chat_id, message_id=message_id,
                                 sender_id=user_id, direction="incoming", body=body,
-                                metadata_json={"chat_type": chat_type}))
-        await session.commit()
+                                metadata_json={"chat_type": chat_type, "is_mentioned": is_mentioned,
+                                               "is_reply_to_bot": is_reply_to_bot}))
         command = body.split(maxsplit=1)[0].lower() if body.startswith("/") else ""
-        if not is_group or is_mentioned or command:
-            session.add(Job(bot_id=bot_id, chat_id=chat_id, payload={"kind": "message", "text": body,
-                        "message_id": message_id, "sender_id": user_id, "command": command,
-                        "is_group": is_group}))
-            await session.commit()
+        session.add(Job(bot_id=bot_id, chat_id=chat_id, payload={"kind": "message", "text": body,
+                    "message_id": message_id, "sender_id": user_id, "command": command,
+                    "is_group": is_group, "is_mentioned": is_mentioned,
+                    "is_reply_to_bot": is_reply_to_bot,
+                    "reply": ({"author_id": str(reply.author_id), "message_id": str(reply.sync_id),
+                               "body": reply.body} if reply else None)}))
+        await session.commit()
 
 
 def make_bot() -> Bot:

@@ -51,7 +51,6 @@ async def startup():
                 record.name = item.get("name", record.name)
                 record.enabled = item.get("enabled", record.enabled)
                 record.default_handler = item.get("default_handler", record.default_handler)
-        await session.execute(text("UPDATE jobs SET status='pending' WHERE status='processing'"))
         await session.commit()
         configured_bots = (await session.scalars(
             select(Bot).where(Bot.enabled.is_(True), Bot.cts_url.is_not(None), Bot.secret_key.is_not(None))
@@ -161,6 +160,7 @@ async def dispatch_template_message(bot_record: Bot, request: HandlerRequest) ->
     if (
         registration.id == "echo"
         and bot_record.default_handler not in ("", "echo")
+        and (request.chat_type != "group" or request.metadata.get("is_mentioned") or request.metadata.get("is_reply_to_bot") or command_name)
         and not template_class.has_command(command_name)
     ):
         result = await resolve_handler(bot_record.default_handler).handle(request)
@@ -188,11 +188,35 @@ async def dispatch_queued_message(
         message_id=payload["message_id"],
         text=payload["text"],
         command=command_name,
+        metadata={"is_mentioned": payload.get("is_mentioned", False),
+                  "is_reply_to_bot": payload.get("is_reply_to_bot", False),
+                  "reply": payload.get("reply")},
     )
     return await dispatch_template_message(bot_record, request)
 
 
 async def job_worker(bot_client):
+    # Only one release may own the worker during blue-green overlap. Keep the
+    # advisory lock on a dedicated connection until the worker is cancelled.
+    if engine.dialect.name == "postgresql":
+        async with engine.connect() as connection:
+            while not await connection.scalar(text("SELECT pg_try_advisory_lock(73412019)")):
+                await asyncio.sleep(settings.worker_poll_seconds)
+            try:
+                await recover_jobs_and_work(bot_client)
+            finally:
+                await connection.execute(text("SELECT pg_advisory_unlock(73412019)"))
+    else:
+        await recover_jobs_and_work(bot_client)
+
+
+async def recover_jobs_and_work(bot_client):
+    async with Session.begin() as session:
+        await session.execute(text("UPDATE jobs SET status='pending' WHERE status='processing'"))
+    await process_jobs(bot_client)
+
+
+async def process_jobs(bot_client):
     while True:
         async with Session() as session:
             async with session.begin():

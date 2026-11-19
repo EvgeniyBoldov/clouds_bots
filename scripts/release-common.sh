@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+
+if [[ -z "${BASH_VERSION:-}" ]]; then
+  echo "This helper is Bash-only." >&2
+  return 1 2>/dev/null || exit 1
+fi
+set -Eeuo pipefail
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+RELEASE_PHASE="startup"
+RELEASE_PHASE_STARTED_AT=$SECONDS
+release_log() { printf '[clouds-bots-deploy %s] %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$*" >&2; }
+release_phase_start() { RELEASE_PHASE="$1"; RELEASE_PHASE_STARTED_AT=$SECONDS; release_log "START: $RELEASE_PHASE"; }
+release_phase_end() { release_log "DONE: $RELEASE_PHASE (duration: $((SECONDS - RELEASE_PHASE_STARTED_AT))s)"; }
+release_error_trap() { local status=$?; release_log "ERROR: phase=$RELEASE_PHASE status=$status location=${BASH_SOURCE[1]-unknown}:${BASH_LINENO[0]-unknown} command=$BASH_COMMAND"; }
+release_exit_trap() { local status=$?; test "$status" -eq 0 || release_log "EXIT: phase=$RELEASE_PHASE status=$status"; }
+trap release_error_trap ERR
+trap release_exit_trap EXIT
+fail() { release_log "ERROR: $*"; exit 1; }
+require_command() { command -v "$1" >/dev/null 2>&1 || fail "Required command is unavailable: $1"; }
+load_release_file() {
+  local file="$1"
+  test -f "$file" || fail "Missing release manifest: $file"
+  awk '/^[[:space:]]*($|#)/ { next } /^[A-Z][A-Z0-9_]*=[-A-Za-z0-9._:\/@]*$/ { key=$0; sub(/=.*/, "", key); if (seen[key]++) exit 1; next } { exit 1 }' "$file" || fail "Release manifest contains invalid or duplicate entries: $file"
+  set -a; source "$file"; set +a
+  local key
+  for key in RELEASE_VERSION REGISTRY IMAGE BLUE_PORT GREEN_PORT; do [[ -n "${!key:-}" ]] || fail "$key is required in release.env"; done
+  [[ "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "RELEASE_VERSION must be X.Y.Z"
+  if [[ "${2:-}" != bootstrap ]]; then
+    [[ "${RELEASE_COMMIT:-}" =~ ^[0-9a-f]{7,64}$ ]] || fail "RELEASE_COMMIT must be a Git commit SHA"
+  fi
+  if [[ "${2:-}" != bootstrap && "${2:-}" != legacy ]]; then
+    [[ "${BASE_VERSION:-}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "BASE_VERSION must be X.Y.Z"
+    [[ "${BASE_INPUT_SHA256:-}" =~ ^[a-f0-9]{64}$ ]] || fail "BASE_INPUT_SHA256 must be a SHA256"
+    [[ "${BASE_IMAGE:-}" =~ ^[A-Za-z0-9._/:@-]+@sha256:[a-f0-9]{64}$ ]] || fail "BASE_IMAGE must be pinned by digest"
+    [[ "${DB_REVISION:-}" =~ ^[A-Za-z0-9_]+$ ]] || fail "DB_REVISION is required"
+  fi
+  [[ "$BLUE_PORT" =~ ^[0-9]+$ && "$GREEN_PORT" =~ ^[0-9]+$ ]] || fail "BLUE_PORT and GREEN_PORT must be numeric"
+}
+hash_file() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'; else shasum -a 256 "$1" | awk '{print $1}'; fi
+}
+base_input_sha() {
+  local dockerfile_sha requirements_sha
+  dockerfile_sha="$(hash_file "$REPO_ROOT/projects/gateway-base/Dockerfile")"
+  requirements_sha="$(hash_file "$REPO_ROOT/pyproject.toml")"
+  if command -v sha256sum >/dev/null 2>&1; then
+    printf 'Dockerfile=%s\nrequirements.txt=%s\n' "$dockerfile_sha" "$requirements_sha" | sha256sum | awk '{print $1}'
+  else
+    printf 'Dockerfile=%s\nrequirements.txt=%s\n' "$dockerfile_sha" "$requirements_sha" | shasum -a 256 | awk '{print $1}'
+  fi
+}
+require_clean_worktree() {
+  git -C "$REPO_ROOT" diff --quiet || fail "Working tree has unstaged changes."
+  git -C "$REPO_ROOT" diff --cached --quiet || fail "Working tree has staged changes."
+  test -z "$(git -C "$REPO_ROOT" status --porcelain --untracked-files=normal)" || fail "Working tree has untracked changes."
+}
