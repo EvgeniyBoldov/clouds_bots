@@ -22,6 +22,17 @@ class Bot(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class InternalBot(Base):
+    __tablename__ = "internal_bots"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name: Mapped[str] = mapped_column(String(200))
+    template_id: Mapped[str] = mapped_column(String(64), default="echo")
+    default_handler: Mapped[str] = mapped_column(String(100), default="echo")
+    botx_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("bots.id"), unique=True)
+    groups_enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
+    group_history_enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
+
+
 class Chat(Base):
     __tablename__ = "chats"
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -62,14 +73,40 @@ class InboundEvent(Base):
 class UserGrant(Base):
     __tablename__ = "user_grants"
     id: Mapped[int] = mapped_column(primary_key=True)
-    bot_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("bots.id"))
+    internal_bot_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("internal_bots.id"))
     user_id: Mapped[str] = mapped_column(String(200))
     identity_type: Mapped[str] = mapped_column(String(16), default="huid", server_default="huid")
     identity_value: Mapped[str | None] = mapped_column(String(320), nullable=True)
     ad_domain: Mapped[str | None] = mapped_column(String(255), nullable=True)
     permission: Mapped[str] = mapped_column(String(100), default="use")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-    __table_args__ = (UniqueConstraint("bot_id", "user_id", "permission"),)
+    __table_args__ = (UniqueConstraint("internal_bot_id", "user_id", "permission"),)
+
+
+class NotificationIntegration(Base):
+    __tablename__ = "notification_integrations"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(200))
+    description: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class NotificationToken(Base):
+    __tablename__ = "notification_tokens"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    integration_id: Mapped[int] = mapped_column(ForeignKey("notification_integrations.id"), index=True)
+    bot_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("bots.id"))
+    digest: Mapped[str] = mapped_column(String(64), unique=True)
+    prefix: Mapped[str] = mapped_column(String(16))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class NotificationRoute(Base):
+    __tablename__ = "notification_routes"
+    integration_id: Mapped[int] = mapped_column(ForeignKey("notification_integrations.id"), primary_key=True)
+    bot_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("bots.id"), primary_key=True)
+    chat_ids: Mapped[list[str]] = mapped_column(JSONB, default=list)
 
 
 class Job(Base):
@@ -80,4 +117,6 @@ class Job(Base):
     payload: Mapped[dict] = mapped_column(JSONB)
     status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
     attempts: Mapped[int] = mapped_column(Integer, default=0)
+    notification_token_id: Mapped[int | None] = mapped_column(ForeignKey("notification_tokens.id"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    __table_args__ = (Index("ix_jobs_notification_token_id_id", "notification_token_id", "id"),)

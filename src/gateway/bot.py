@@ -77,6 +77,9 @@ class RuntimeBotAccountProvider(BotAccountProvider):
             key = BotAccountKey(server_id=host, bot_id=account.id)
             account = account.model_copy(update={"account_key": key})
         with self._lock:
+            for previous_key in tuple(self._accounts):
+                if previous_key.bot_id == account.id and previous_key != key:
+                    del self._accounts[previous_key]
             self._accounts[key] = account
         return key
 
@@ -104,16 +107,19 @@ async def incoming_message(message: IncomingMessage, bot: Bot) -> None:
     chat_type = str(getattr(message.chat, "type", "unknown")).lower()
     is_group = "group" in chat_type
     from .main import Session
-    from .models import Bot as BotRecord, Chat, Message, InboundEvent, Job, UserGrant
+    from .models import Bot as BotRecord, Chat, InternalBot, Message, InboundEvent, Job, UserGrant
     async with Session() as session:
         bot_record = await session.get(BotRecord, bot_id)
         if bot_record is None or not bot_record.enabled:
+            return
+        internal_bot = await session.scalar(select(InternalBot).where(InternalBot.botx_id == bot_id))
+        if internal_bot is None or (is_group and not internal_bot.groups_enabled):
             return
         if not is_group:
             grant_id = await session.scalar(
                 select(UserGrant.id)
                 .where(
-                    UserGrant.bot_id == bot_id,
+                    UserGrant.internal_bot_id == internal_bot.id,
                     UserGrant.user_id == user_id,
                     UserGrant.permission == "use",
                 )
@@ -129,17 +135,20 @@ async def incoming_message(message: IncomingMessage, bot: Bot) -> None:
         prior = await session.scalar(select(InboundEvent).where(InboundEvent.bot_id == bot_id, InboundEvent.message_id == message_id))
         if prior:
             return
+        keep_history = chat.history_enabled and (not is_group or internal_bot.group_history_enabled)
         session.add(InboundEvent(bot_id=bot_id, message_id=message_id, chat_id=chat_id,
-                                 payload={"sender_id": user_id, "body": body, "chat_type": chat_type,
+                                 payload={"sender_id": user_id, "chat_type": chat_type,
                                           "is_group": is_group, "is_mentioned": is_mentioned,
                                           "is_reply_to_bot": is_reply_to_bot}))
-        if chat.history_enabled:
+        if keep_history:
             session.add(Message(bot_id=bot_id, chat_id=chat_id, message_id=message_id,
                                 sender_id=user_id, direction="incoming", body=body,
                                 metadata_json={"chat_type": chat_type, "is_mentioned": is_mentioned,
                                                "is_reply_to_bot": is_reply_to_bot}))
         command = body.split(maxsplit=1)[0].lower() if body.startswith("/") else ""
         session.add(Job(bot_id=bot_id, chat_id=chat_id, payload={"kind": "message", "text": body,
+                    "internal_bot_id": str(internal_bot.id),
+                    "retain_content": keep_history,
                     "message_id": message_id, "sender_id": user_id, "command": command,
                     "is_group": is_group, "is_mentioned": is_mentioned,
                     "is_reply_to_bot": is_reply_to_bot,

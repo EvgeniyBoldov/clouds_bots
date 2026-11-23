@@ -176,6 +176,9 @@ def test_template_routes_validate_and_update_binding(monkeypatch):
         async def get(self, _model, _bot_id):
             return self.record
 
+        async def scalar(self, _query):
+            return None
+
         async def commit(self):
             return None
 
@@ -237,6 +240,15 @@ def test_create_bot_persists_selected_template_and_updates_runtime_provider(monk
 
         async def get(self, _model, _bot_id):
             return record
+
+        async def scalar(self, _query):
+            return None
+
+        async def flush(self):
+            return None
+
+        def add(self, _record):
+            return None
 
         async def commit(self):
             return None

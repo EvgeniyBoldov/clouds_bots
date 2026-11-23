@@ -2,12 +2,15 @@ import json
 import uuid
 import asyncio
 import hmac
+import hashlib
+import secrets
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 
-from fastapi import FastAPI, Depends, Header, HTTPException, Request
+import httpx
+from fastapi import FastAPI, Depends, Header, HTTPException, Query, Request
 from fastapi import Path as PathParam
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi import Response
@@ -15,10 +18,17 @@ from pydantic import AnyHttpUrl, BaseModel, Field, field_validator
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 from pybotx import FastAPIBotAppConfig, setup_fastapi_bot
-from pybotx import BotAccountKey, BotAccountWithSecret, UserNotFoundError
+from pybotx import (
+    BotAccountKey, BotAccountWithSecret, InvalidBotAccountError, PermissionDeniedError,
+    RateLimitReachedError, UnknownBotAccountError, UserNotFoundError,
+)
+from pybotx.client.exceptions.base import BaseClientError
 
 from .config import settings
-from .models import Base, Bot, Chat, Message, UserGrant, Job
+from .models import (
+    Base, Bot, Chat, InternalBot, Job, Message, NotificationIntegration, NotificationRoute,
+    NotificationToken, UserGrant,
+)
 from .integrations import EchoHandler, HttpHandler, HandlerRequest
 from .templates import get_template, template_catalog
 
@@ -38,13 +48,19 @@ async def startup():
             ident = uuid.UUID(item["bot_id"])
             record = await session.get(Bot, ident)
             if not record:
-                session.add(Bot(
+                record = Bot(
                     id=ident,
                     name=item.get("name", str(ident)),
                     enabled=item.get("enabled", True),
                     default_handler=item.get("default_handler", "echo"),
                     cts_url=item.get("cts_url"),
                     secret_key=item.get("secret_key"),
+                )
+                session.add(record)
+                await session.flush()
+                session.add(InternalBot(
+                    id=record.id, botx_id=record.id, name=record.name,
+                    template_id=record.template_id, default_handler=record.default_handler,
                 ))
             elif not record.cts_url or not record.secret_key:
                 record.cts_url = item.get("cts_url")
@@ -142,7 +158,7 @@ async def legacy_summary(bot_id: uuid.UUID, chat_id: uuid.UUID, payload: dict) -
         return "\n".join(summaries) or "Не удалось сформировать саммари."
 
 
-async def dispatch_template_message(bot_record: Bot, request: HandlerRequest) -> str:
+async def dispatch_template_message(bot_record: InternalBot | Bot, request: HandlerRequest) -> str:
     registration = get_template(bot_record.template_id)
     if registration is None:
         return f"Шаблон бота «{bot_record.template_id}» недоступен. Выберите доступный шаблон в админке."
@@ -150,6 +166,8 @@ async def dispatch_template_message(bot_record: Bot, request: HandlerRequest) ->
     template_class = registration.bot_class
     command_name = request.command.lower() if request.command else None
     if command_name == "/summary" and not template_class.has_command("/summary"):
+        if isinstance(bot_record, InternalBot) and not bot_record.group_history_enabled:
+            return "Хранение истории групп для этого бота выключено."
         payload = {
             "text": request.text,
             "sender_id": request.user_id,
@@ -173,7 +191,7 @@ async def dispatch_template_message(bot_record: Bot, request: HandlerRequest) ->
 
 
 async def dispatch_queued_message(
-    bot_record: Bot,
+    bot_record: InternalBot,
     bot_id: uuid.UUID,
     chat_id: uuid.UUID,
     payload: dict,
@@ -234,10 +252,22 @@ async def process_jobs(bot_client):
             try:
                 if payload.get("kind") in {"summary", "message"}:
                     async with session.begin():
-                        bot_record = await session.get(Bot, bot_id)
-                    if bot_record is None:
-                        raise RuntimeError("bot record not found for queued message")
-                    output = await dispatch_queued_message(bot_record, bot_id, chat_id, payload)
+                        internal_bot = await session.scalar(
+                            select(InternalBot).where(InternalBot.botx_id == bot_id)
+                        )
+                    if internal_bot is None or (
+                        payload.get("internal_bot_id") and payload["internal_bot_id"] != str(internal_bot.id)
+                    ):
+                        output = ""
+                    elif payload.get("is_group") and not internal_bot.groups_enabled:
+                        output = ""
+                    else:
+                        output = await dispatch_queued_message(internal_bot, bot_id, chat_id, payload)
+                        if payload.get("is_group") and not (
+                            payload.get("command") or payload.get("kind") == "summary"
+                            or payload.get("is_mentioned") or payload.get("is_reply_to_bot")
+                        ):
+                            output = ""
                 else:
                     output = payload["text"]
                 if output:
@@ -245,15 +275,21 @@ async def process_jobs(bot_client):
                         bot_client.send_message(bot_id=bot_id, chat_id=chat_id, body=output),
                         timeout=20,
                     )
-            except Exception:
+            except Exception as exc:
                 status = "pending" if attempts < 3 else "failed"
+                delivery_error = "timeout" if isinstance(exc, TimeoutError) else "send_failed"
             else:
                 status = "completed"
+                delivery_error = None
 
             async with session.begin():
                 record = await session.get(Job, job_id)
                 if record:
                     record.status = status
+                    if record.notification_token_id is not None:
+                        record.payload = {**payload, "delivery_error": delivery_error}
+                    elif payload.get("retain_content") is False and status in {"completed", "failed"}:
+                        record.payload = {k: v for k, v in payload.items() if k not in {"text", "reply"}}
 
 
 ADMIN_SESSION_COOKIE = "gateway_admin_session"
@@ -380,31 +416,87 @@ async def list_bots():
         return [bot_record_response(b) for b in rows]
 
 
+@app.get("/api/v1/admin/botx", dependencies=[Depends(authorized)])
+async def list_botx():
+    async with Session() as session:
+        rows = await session.execute(
+            select(Bot, InternalBot).outerjoin(InternalBot, InternalBot.botx_id == Bot.id)
+            .order_by(Bot.name, Bot.id)
+        )
+        return [{
+            **bot_record_response(record),
+            "internal_bot_id": linked.id if linked else None,
+            "internal_bot_name": linked.name if linked else None,
+        } for record, linked in rows]
+
+
+@app.post("/api/v1/admin/botx/{bot_id}/check", dependencies=[Depends(authorized)])
+async def check_botx(bot_id: uuid.UUID):
+    async with Session() as session:
+        record = await session.get(Bot, bot_id)
+        if record is None:
+            raise HTTPException(404, "Подключение BotX не найдено.")
+        if not record.enabled or not record.cts_url or not record.secret_key:
+            raise HTTPException(409, "Подключение отключено или не настроено.")
+
+    try:
+        chats = await asyncio.wait_for(bot.list_chats(bot_id=bot_id), timeout=10)
+    except (TimeoutError, httpx.TimeoutException) as exc:
+        raise HTTPException(504, "CTS не ответил за время проверки.") from exc
+    except httpx.RequestError as exc:
+        raise HTTPException(502, "Не удалось связаться с CTS. Проверьте адрес и сетевой доступ.") from exc
+    except InvalidBotAccountError as exc:
+        raise HTTPException(502, "Не удалось авторизовать бота в CTS. Сверьте его учётные данные.") from exc
+    except PermissionDeniedError as exc:
+        raise HTTPException(502, "CTS запретил боту запрашивать список чатов.") from exc
+    except RateLimitReachedError as exc:
+        raise HTTPException(503, "CTS ограничил частоту запросов. Повторите проверку позже.") from exc
+    except UnknownBotAccountError as exc:
+        raise HTTPException(409, "Учётная запись ещё не загружена шлюзом.") from exc
+    except BaseClientError as exc:
+        raise HTTPException(502, "CTS вернул ошибку при запросе списка чатов.") from exc
+    return {"status": "ok", "chat_count": len(chats)}
+
+
 def bot_record_response(record: Bot) -> dict:
     return {
         "bot_id": str(record.id),
         "name": record.name,
         "cts_url": record.cts_url,
         "enabled": record.enabled,
+        "notification_ready": bool(record.enabled and record.cts_url and record.secret_key),
         "default_handler": record.default_handler,
         "template_id": record.template_id,
         "template_status": "available" if get_template(record.template_id) else "unavailable",
     }
 
 
-class BotCreateRequest(BaseModel):
+class BotXCreateRequest(BaseModel):
     bot_id: uuid.UUID
     cts_url: AnyHttpUrl
     secret_key: str = Field(min_length=1, max_length=4096)
     name: str = Field(min_length=1, max_length=200)
+
+
+class BotCreateRequest(BotXCreateRequest):
     template_id: str = Field(default="echo", min_length=1, max_length=64)
 
 
 @app.post("/api/v1/admin/bots", dependencies=[Depends(authorized)], status_code=201)
 async def create_bot(req: BotCreateRequest):
-    if not req.name.strip() or not req.secret_key.strip():
+    return await register_botx(req, req.template_id)
+
+
+@app.post("/api/v1/admin/botx", dependencies=[Depends(authorized)], status_code=201)
+async def create_botx(req: BotXCreateRequest):
+    return await register_botx(req, None)
+
+
+async def register_botx(req: BotXCreateRequest, template_id: str | None):
+    if (not req.name.strip() or not req.secret_key.strip()
+        or "\x00" in req.name or "\x00" in req.secret_key):
         raise HTTPException(422, "Bot name and secret key are required")
-    if get_template(req.template_id) is None:
+    if template_id is not None and get_template(template_id) is None:
         raise HTTPException(422, "Unknown bot template")
 
     async with Session() as session:
@@ -417,7 +509,7 @@ async def create_bot(req: BotCreateRequest):
                 name=req.name.strip(),
                 enabled=True,
                 default_handler="echo",
-                template_id=req.template_id,
+                template_id=template_id or "echo",
                 cts_url=str(req.cts_url),
                 secret_key=req.secret_key,
                 credential_revision=1,
@@ -426,30 +518,40 @@ async def create_bot(req: BotCreateRequest):
         else:
             record.name = req.name.strip()
             record.enabled = True
-            record.template_id = req.template_id
+            if template_id is not None:
+                record.template_id = template_id
             record.cts_url = str(req.cts_url)
             record.secret_key = req.secret_key
             record.credential_revision += 1
+        if template_id is not None:
+            await session.flush()
+            linked = await session.scalar(select(InternalBot).where(InternalBot.botx_id == record.id))
+            if linked:
+                linked.template_id = template_id
+            else:
+                session.add(InternalBot(
+                    name=record.name, botx_id=record.id, template_id=template_id,
+                    default_handler=record.default_handler,
+                ))
         await session.commit()
         await session.refresh(record)
 
+    publish_botx_credentials(record)
+    return bot_record_response(record)
+
+
+def publish_botx_credentials(record: Bot) -> None:
     account = BotAccountWithSecret(
         id=record.id,
         cts_url=record.cts_url,
         secret_key=record.secret_key,
-        account_key=BotAccountKey(
-            server_id=BotAccountWithSecret(
-                id=record.id,
-                cts_url=record.cts_url,
-                secret_key=record.secret_key,
-            ).host.casefold(),
-            bot_id=record.id,
-        ),
         revision=record.credential_revision,
     )
+    account = account.model_copy(update={
+        "account_key": BotAccountKey(server_id=account.host.casefold(), bot_id=record.id),
+    })
     account_key = account_provider.upsert(account)
     bot.invalidate_account(account_key)
-    return bot_record_response(record)
 
 
 class BotTemplateUpdate(BaseModel):
@@ -465,13 +567,155 @@ async def update_bot_template(bot_id: uuid.UUID, req: BotTemplateUpdate):
         if record is None:
             raise HTTPException(404, "Bot not found")
         record.template_id = req.template_id
+        linked = await session.scalar(select(InternalBot).where(InternalBot.botx_id == bot_id))
+        if linked:
+            linked.template_id = req.template_id
         await session.commit()
         await session.refresh(record)
         return bot_record_response(record)
 
 
+_INTERNAL_BOTS_URL = "/api/v1/admin/internal-bots"
+
+
+class InternalBotRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    template_id: str = Field(min_length=1, max_length=64)
+    groups_enabled: bool = True
+    group_history_enabled: bool = True
+    botx_id: uuid.UUID | None = None
+
+
+def internal_bot_info(record: InternalBot) -> dict:
+    return {
+        "id": record.id, "name": record.name, "template_id": record.template_id,
+        "botx_id": record.botx_id, "groups_enabled": record.groups_enabled,
+        "group_history_enabled": record.group_history_enabled,
+    }
+
+
+def update_internal_settings(record: InternalBot, req: InternalBotRequest) -> None:
+    name = req.name.strip()
+    if not name or "\x00" in name:
+        raise HTTPException(422, "Bot name is invalid")
+    if get_template(req.template_id) is None and req.template_id != record.template_id:
+        raise HTTPException(422, "Unknown bot template")
+    record.name = name
+    record.template_id = req.template_id
+    record.groups_enabled = req.groups_enabled
+    record.group_history_enabled = req.group_history_enabled
+
+
+async def validate_internal_bot_connection(session, botx_id: uuid.UUID | None, internal_bot_id=None):
+    if botx_id is None:
+        return
+    if not await session.get(Bot, botx_id, with_for_update=True):
+        raise HTTPException(404, "BotX connection not found")
+    linked = await session.scalar(select(InternalBot.id).where(InternalBot.botx_id == botx_id))
+    if linked is not None and linked != internal_bot_id:
+        raise HTTPException(409, "BotX already has an incoming handler")
+
+
+@app.get(_INTERNAL_BOTS_URL, dependencies=[Depends(authorized)])
+async def list_internal_bots():
+    async with Session() as session:
+        rows = await session.scalars(select(InternalBot).order_by(InternalBot.name, InternalBot.id))
+        return [internal_bot_info(row) for row in rows]
+
+
+@app.post(_INTERNAL_BOTS_URL, dependencies=[Depends(authorized)], status_code=201)
+async def create_internal_bot(req: InternalBotRequest):
+    async with Session.begin() as session:
+        await validate_internal_bot_connection(session, req.botx_id)
+        record = InternalBot(botx_id=req.botx_id)
+        update_internal_settings(record, req)
+        session.add(record)
+        await session.flush()
+        return internal_bot_info(record)
+
+
+@app.put(_INTERNAL_BOTS_URL + "/{internal_bot_id}", dependencies=[Depends(authorized)])
+async def update_internal_bot(internal_bot_id: uuid.UUID, req: InternalBotRequest):
+    async with Session.begin() as session:
+        change_connection = "botx_id" in req.model_fields_set
+        if change_connection:
+            await validate_internal_bot_connection(session, req.botx_id, internal_bot_id)
+        record = await session.get(InternalBot, internal_bot_id, with_for_update=True)
+        if not record:
+            raise HTTPException(404, "Internal bot not found")
+        update_internal_settings(record, req)
+        if change_connection:
+            record.botx_id = req.botx_id
+        return internal_bot_info(record)
+
+
+class BotXBindingRequest(BaseModel):
+    internal_bot_id: uuid.UUID | None
+
+
+class BotXUpdateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    cts_url: AnyHttpUrl | None = None
+    secret_key: str | None = Field(default=None, min_length=1, max_length=4096)
+    internal_bot_id: uuid.UUID | None = None
+
+
+@app.put("/api/v1/admin/botx/{botx_id}", dependencies=[Depends(authorized)])
+async def update_botx(botx_id: uuid.UUID, req: BotXUpdateRequest):
+    name = req.name.strip()
+    if not name or "\x00" in name:
+        raise HTTPException(422, "BotX name is invalid")
+    if req.secret_key is not None and (not req.secret_key.strip() or "\x00" in req.secret_key):
+        raise HTTPException(422, "Secret key is invalid")
+
+    async with Session.begin() as session:
+        connection = await session.get(Bot, botx_id, with_for_update=True)
+        if not connection:
+            raise HTTPException(404, "BotX connection not found")
+        if "internal_bot_id" in req.model_fields_set:
+            await set_botx_handler(session, botx_id, req.internal_bot_id)
+        connection.name = name
+        cts_url = str(req.cts_url) if req.cts_url else connection.cts_url
+        secret = req.secret_key if req.secret_key is not None else connection.secret_key
+        changed = (cts_url, secret) != (connection.cts_url, connection.secret_key)
+        if changed:
+            connection.cts_url, connection.secret_key = cts_url, secret
+            connection.credential_revision += 1
+
+    if changed and connection.enabled and connection.cts_url and connection.secret_key:
+        publish_botx_credentials(connection)
+    return bot_record_response(connection)
+
+
+@app.put("/api/v1/admin/botx/{botx_id}/handler", dependencies=[Depends(authorized)])
+async def bind_botx_handler(botx_id: uuid.UUID, req: BotXBindingRequest):
+    async with Session.begin() as session:
+        connection = await session.get(Bot, botx_id, with_for_update=True)
+        if not connection:
+            raise HTTPException(404, "BotX connection not found")
+        await set_botx_handler(session, botx_id, req.internal_bot_id)
+    return {"internal_bot_id": req.internal_bot_id}
+
+
+async def set_botx_handler(session, botx_id: uuid.UUID, internal_bot_id: uuid.UUID | None):
+    target = await session.get(InternalBot, internal_bot_id, with_for_update=True) if internal_bot_id else None
+    if internal_bot_id and not target:
+        raise HTTPException(404, "Internal bot not found")
+    if target and target.botx_id and target.botx_id != botx_id:
+        raise HTTPException(409, "Internal bot is already linked to another BotX")
+    current = await session.scalar(
+        select(InternalBot).where(InternalBot.botx_id == botx_id).with_for_update()
+    )
+    if current and current != target:
+        current.botx_id = None
+        await session.flush()
+    if target:
+        target.botx_id = botx_id
+
+
 class GrantRequest(BaseModel):
-    bot_id: uuid.UUID
+    bot_id: uuid.UUID | None = None
+    internal_bot_id: uuid.UUID | None = None
     identity_type: Literal["email", "ad", "huid"]
     identity: str = Field(min_length=1, max_length=320)
     ad_domain: str | None = Field(default=None, max_length=255)
@@ -481,7 +725,8 @@ class GrantRequest(BaseModel):
 def grant_response(grant: UserGrant) -> dict:
     return {
         "id": grant.id,
-        "bot_id": str(grant.bot_id),
+        "internal_bot_id": str(grant.internal_bot_id),
+        "bot_id": str(grant.internal_bot_id),
         "identity_type": grant.identity_type,
         "identity": grant.identity_value or grant.user_id,
         "ad_domain": grant.ad_domain,
@@ -493,9 +738,14 @@ def grant_response(grant: UserGrant) -> dict:
 @app.post("/api/v1/admin/grants", dependencies=[Depends(authorized)])
 async def create_grant(req: GrantRequest):
     async with Session() as s:
-        bot_record = await s.get(Bot, req.bot_id)
-        if not bot_record or not bot_record.enabled or not bot_record.cts_url or not bot_record.secret_key:
-            raise HTTPException(404, "Bot not found or not connected")
+        if req.internal_bot_id:
+            internal_bot = await s.get(InternalBot, req.internal_bot_id)
+        elif req.bot_id:
+            internal_bot = await s.scalar(select(InternalBot).where(InternalBot.botx_id == req.bot_id))
+        else:
+            raise HTTPException(422, "Internal bot is required")
+        if not internal_bot:
+            raise HTTPException(404, "Internal bot not found")
 
         identity = req.identity.strip()
         if not identity:
@@ -512,17 +762,20 @@ async def create_grant(req: GrantRequest):
                 raise HTTPException(422, "HUID must be a UUID") from exc
             identity_value = resolved_huid
         else:
+            bot_record = await s.get(Bot, internal_bot.botx_id) if internal_bot.botx_id else None
+            if not bot_record or not bot_record.enabled or not bot_record.cts_url or not bot_record.secret_key:
+                raise HTTPException(422, "Link a connected BotX to resolve users by email or AD")
             try:
                 if req.identity_type == "email":
                     if "@" not in identity or any(char.isspace() for char in identity):
                         raise HTTPException(422, "Email address is invalid")
                     resolved_user = await bot.search_user_by_email_post(
-                        bot_id=req.bot_id,
+                        bot_id=bot_record.id,
                         email=identity,
                     )
                 else:
                     resolved_user = await bot.search_user_by_ad(
-                        bot_id=req.bot_id,
+                        bot_id=bot_record.id,
                         ad_login=identity,
                         ad_domain=req.ad_domain.strip(),
                     )
@@ -536,14 +789,14 @@ async def create_grant(req: GrantRequest):
             identity_value = identity
 
         existing = await s.scalar(select(UserGrant).where(
-            UserGrant.bot_id == req.bot_id,
+            UserGrant.internal_bot_id == internal_bot.id,
             UserGrant.user_id == resolved_huid,
             UserGrant.permission == req.permission,
         ))
         if existing:
             return {"status": "granted", "grant": grant_response(existing)}
         grant = UserGrant(
-            bot_id=req.bot_id,
+            internal_bot_id=internal_bot.id,
             user_id=resolved_huid,
             identity_type=req.identity_type,
             identity_value=identity_value,
@@ -589,16 +842,234 @@ async def update_chat(req: ChatSettings):
     return {"status": "updated"}
 
 
+_INTEGRATIONS_URL = "/api/v1/admin/notification-integrations"
+NotificationPathId = Annotated[int, PathParam(ge=1, le=2_147_483_647)]
+
+
+class NotificationRouteRequest(BaseModel):
+    chat_ids: list[uuid.UUID] = Field(default_factory=list, max_length=100)
+
+
+class NotificationRouteInput(NotificationRouteRequest):
+    bot_id: uuid.UUID
+
+
+class NotificationIntegrationRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    description: str = Field(min_length=1, max_length=4000)
+    routes: list[NotificationRouteInput] | None = Field(default=None, max_length=100)
+
+    @field_validator("name", "description", mode="before")
+    @classmethod
+    def strip_text(cls, value):
+        if isinstance(value, str):
+            if "\x00" in value:
+                raise ValueError("Text must not contain null characters")
+            return value.strip()
+        return value
+
+
+def notification_token_digest(secret: str) -> str:
+    return hashlib.sha256(secret.encode("utf-8")).hexdigest()
+
+
+def notification_token_info(token: NotificationToken) -> dict:
+    return {
+        "id": token.id,
+        "bot_id": token.bot_id,
+        "prefix": token.prefix,
+        "created_at": token.created_at,
+        "revoked_at": token.revoked_at,
+    }
+
+
+@app.get(_INTEGRATIONS_URL, dependencies=[Depends(authorized)])
+async def list_notification_integrations():
+    async with Session() as session:
+        rows = await session.execute(
+            select(NotificationIntegration, NotificationToken)
+            .outerjoin(NotificationToken, NotificationToken.integration_id == NotificationIntegration.id)
+            .order_by(NotificationIntegration.id.desc(), NotificationToken.id.desc())
+        )
+        result = {}
+        for row, token in rows:
+            integration = result.setdefault(row.id, {
+                "id": row.id, "name": row.name, "description": row.description,
+                "created_at": row.created_at, "tokens": [], "routes": [],
+            })
+            if token:
+                integration["tokens"].append(notification_token_info(token))
+        routes = await session.execute(
+            select(NotificationRoute, Bot).join(Bot).order_by(Bot.name, Bot.id)
+        )
+        for route, connection in routes:
+            if route.integration_id in result:
+                result[route.integration_id]["routes"].append({
+                    "bot_id": route.bot_id, "bot_name": connection.name, "chat_ids": route.chat_ids,
+                })
+    return list(result.values())
+
+
+async def issue_notification_token(session, integration_id: int):
+    secret = "ntf_" + secrets.token_urlsafe(32)
+    token = NotificationToken(
+        integration_id=integration_id,
+        digest=notification_token_digest(secret), prefix=secret[:12],
+    )
+    session.add(token)
+    await session.flush()
+    return {**notification_token_info(token), "token": secret}
+
+
+async def replace_notification_routes(session, integration_id: int, inputs: list[NotificationRouteInput]):
+    requested = {item.bot_id: item for item in inputs}
+    if len(requested) != len(inputs):
+        raise HTTPException(422, "Choose each BotX only once")
+    if requested:
+        known = set(await session.scalars(select(Bot.id).where(Bot.id.in_(requested))))
+        if known != requested.keys():
+            raise HTTPException(404, "BotX connection not found")
+
+    current = {
+        route.bot_id: route for route in await session.scalars(
+            select(NotificationRoute).where(NotificationRoute.integration_id == integration_id)
+        )
+    }
+    for bot_id, route in current.items():
+        if bot_id not in requested:
+            await session.delete(route)
+    for bot_id, item in requested.items():
+        route = current.get(bot_id)
+        if route is None:
+            route = NotificationRoute(integration_id=integration_id, bot_id=bot_id)
+            session.add(route)
+        if bot_id not in current or "chat_ids" in item.model_fields_set:
+            route.chat_ids = list(dict.fromkeys(str(chat_id) for chat_id in item.chat_ids))
+
+
+@app.post(_INTEGRATIONS_URL, dependencies=[Depends(authorized)], status_code=201)
+async def create_notification_integration(req: NotificationIntegrationRequest):
+    async with Session.begin() as session:
+        row = NotificationIntegration(name=req.name, description=req.description)
+        session.add(row)
+        await session.flush()
+        if req.routes:
+            await replace_notification_routes(session, row.id, req.routes)
+    return {"id": row.id}
+
+
+@app.put(_INTEGRATIONS_URL + "/{integration_id}", dependencies=[Depends(authorized)])
+async def update_notification_integration(integration_id: NotificationPathId, req: NotificationIntegrationRequest):
+    async with Session.begin() as session:
+        row = await session.get(NotificationIntegration, integration_id, with_for_update=True)
+        if not row:
+            raise HTTPException(404, "Integration not found")
+        row.name, row.description = req.name, req.description
+        if req.routes is not None:
+            await replace_notification_routes(session, row.id, req.routes)
+    return {"id": row.id}
+
+
+@app.put(_INTEGRATIONS_URL + "/{integration_id}/routes/{bot_id}", dependencies=[Depends(authorized)])
+async def upsert_notification_route(
+    integration_id: NotificationPathId, bot_id: uuid.UUID, req: NotificationRouteRequest,
+):
+    async with Session.begin() as session:
+        if not await session.get(NotificationIntegration, integration_id, with_for_update=True):
+            raise HTTPException(404, "Integration not found")
+        if not await session.get(Bot, bot_id):
+            raise HTTPException(404, "BotX connection not found")
+        route = await session.get(NotificationRoute, (integration_id, bot_id))
+        if not route:
+            route = NotificationRoute(integration_id=integration_id, bot_id=bot_id)
+            session.add(route)
+        route.chat_ids = list(dict.fromkeys(str(chat_id) for chat_id in req.chat_ids))
+    return {"bot_id": bot_id, "chat_ids": route.chat_ids}
+
+
+@app.delete(_INTEGRATIONS_URL + "/{integration_id}/routes/{bot_id}", dependencies=[Depends(authorized)], status_code=204)
+async def delete_notification_route(integration_id: NotificationPathId, bot_id: uuid.UUID):
+    async with Session.begin() as session:
+        if not await session.get(NotificationIntegration, integration_id, with_for_update=True):
+            raise HTTPException(404, "Integration not found")
+        route = await session.get(NotificationRoute, (integration_id, bot_id))
+        if route:
+            await session.delete(route)
+    return Response(status_code=204)
+
+
+@app.post(_INTEGRATIONS_URL + "/{integration_id}/tokens", dependencies=[Depends(authorized)], status_code=201)
+async def create_notification_token(
+    integration_id: NotificationPathId, response: Response,
+):
+    async with Session.begin() as session:
+        if not await session.get(NotificationIntegration, integration_id):
+            raise HTTPException(404, "Integration not found")
+        token = await issue_notification_token(session, integration_id)
+    response.headers["Cache-Control"] = "no-store"
+    return token
+
+
+@app.delete(_INTEGRATIONS_URL + "/{integration_id}/tokens/{token_id}", dependencies=[Depends(authorized)], status_code=204)
+async def revoke_notification_token(integration_id: NotificationPathId, token_id: NotificationPathId):
+    async with Session.begin() as session:
+        token = await session.get(NotificationToken, token_id, with_for_update=True)
+        if not token or token.integration_id != integration_id:
+            raise HTTPException(404, "Token not found")
+        if token.revoked_at is None:
+            token.revoked_at = datetime.now(timezone.utc)
+    return Response(status_code=204)
+
+
+@app.get(_INTEGRATIONS_URL + "/{integration_id}/logs", dependencies=[Depends(authorized)])
+async def notification_integration_logs(
+    integration_id: NotificationPathId,
+    before_id: int | None = Query(default=None, ge=1, le=2_147_483_647),
+):
+    async with Session() as session:
+        if not await session.get(NotificationIntegration, integration_id):
+            raise HTTPException(404, "Integration not found")
+        query = (
+            select(Job, NotificationToken.prefix, Bot.name)
+            .join(NotificationToken, Job.notification_token_id == NotificationToken.id)
+            .join(Bot, Job.bot_id == Bot.id)
+            .where(NotificationToken.integration_id == integration_id)
+            .order_by(Job.id.desc()).limit(51)
+        )
+        if before_id is not None:
+            query = query.where(Job.id < before_id)
+        rows = (await session.execute(query)).all()
+    entries = [
+        {
+            "job_id": job.id, "bot_id": job.bot_id, "bot_name": bot_name, "chat_id": job.chat_id,
+            "token_prefix": prefix, "created_at": job.created_at, "status": job.status,
+            "attempts": job.attempts, "delivery_error": job.payload.get("delivery_error"),
+        }
+        for job, prefix, bot_name in rows[:50]
+    ]
+    return {"entries": entries, "next_before_id": entries[-1]["job_id"] if len(rows) > 50 else None}
+
+
 async def authorized_notification(
     request: Request,
     x_notification_token: str | None = Header(default=None),
     x_admin_token: str | None = Header(default=None),
-):
+) -> NotificationToken | None:
     if settings.notification_token and x_notification_token and _constant_time_equal(
         x_notification_token, settings.notification_token
     ):
-        return
+        return None
+    if x_notification_token and x_notification_token.startswith("ntf_"):
+        async with Session() as session:
+            token = await session.scalar(select(NotificationToken).where(
+                NotificationToken.digest == notification_token_digest(x_notification_token),
+                NotificationToken.revoked_at.is_(None),
+            ))
+        if not token:
+            raise HTTPException(401, "Invalid notification token")
+        return token
     await authorized(request, x_admin_token)
+    return None
 
 
 class Notification(BaseModel):
@@ -614,9 +1085,19 @@ class Notification(BaseModel):
         return value
 
 
-@app.post("/api/v1/notifications", dependencies=[Depends(authorized_notification)], status_code=202)
-async def notification(req: Notification):
+async def allows_notification(session, token: NotificationToken, bot_id: uuid.UUID, chat_id: uuid.UUID):
+    if token.bot_id is not None and token.bot_id != bot_id:
+        return False
+    route = await session.get(NotificationRoute, (token.integration_id, bot_id))
+    return bool(route and (not route.chat_ids or str(chat_id) in route.chat_ids))
+
+
+@app.post("/api/v1/messages", status_code=202)
+@app.post("/api/v1/notifications", status_code=202)
+async def notification(req: Notification, token: NotificationToken | None = Depends(authorized_notification)):
     async with Session.begin() as session:
+        if token and not await allows_notification(session, token, req.bot_id, req.chat_id):
+            raise HTTPException(403, "System is not authorized to send to this BotX and chat")
         record = await session.get(Bot, req.bot_id)
         if not record or not record.enabled or not record.cts_url or not record.secret_key:
             raise HTTPException(404, "Bot not found or not connected")
@@ -624,18 +1105,30 @@ async def notification(req: Notification):
             bot_id=req.bot_id,
             chat_id=req.chat_id,
             payload={"text": req.text, "kind": "notification"},
+            notification_token_id=token.id if token else None,
         )
         session.add(job)
         await session.flush()
     return {"job_id": job.id, "status": job.status}
 
 
-@app.get("/api/v1/notifications/{job_id}", dependencies=[Depends(authorized_notification)])
-async def notification_status(job_id: int = PathParam(ge=1, le=2_147_483_647)):
+@app.get("/api/v1/messages/{job_id}")
+@app.get("/api/v1/notifications/{job_id}")
+async def notification_status(
+    job_id: int = PathParam(ge=1, le=2_147_483_647),
+    token: NotificationToken | None = Depends(authorized_notification),
+):
     async with Session() as session:
         job = await session.get(Job, job_id)
         if not job or job.payload.get("kind") != "notification":
             raise HTTPException(404, "Notification not found")
+        if token:
+            owner = await session.get(NotificationToken, job.notification_token_id) if job.notification_token_id else None
+            if (
+                not owner or owner.integration_id != token.integration_id
+                or not await allows_notification(session, token, job.bot_id, job.chat_id)
+            ):
+                raise HTTPException(404, "Notification not found")
         return {"job_id": job.id, "status": job.status, "attempts": job.attempts}
 
 

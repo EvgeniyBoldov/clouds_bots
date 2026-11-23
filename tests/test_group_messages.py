@@ -19,7 +19,7 @@ def sqlite_jsonb(_type, _compiler, **_kw):
 def test_group_history_and_routing(monkeypatch):
     from gateway import main
     from gateway.bot import incoming_message
-    from gateway.models import Base, Bot, Chat, InboundEvent, Job, Message
+    from gateway.models import Base, Bot, Chat, InboundEvent, InternalBot, Job, Message
 
     async def exercise():
         engine = create_async_engine("sqlite+aiosqlite:///:memory:")
@@ -30,6 +30,8 @@ def test_group_history_and_routing(monkeypatch):
         bot_id, chat_id = uuid.uuid4(), uuid.uuid4()
         async with sessions.begin() as session:
             session.add(Bot(id=bot_id, name="test", enabled=True))
+            await session.flush()
+            session.add(InternalBot(botx_id=bot_id, name="test handler"))
         def message(body, mention=False, reply=False):
             return SimpleNamespace(bot=SimpleNamespace(id=bot_id), chat=SimpleNamespace(id=chat_id, type="group_chat"),
                 sender=SimpleNamespace(huid=uuid.uuid4()), sync_id=uuid.uuid4(), body=body,

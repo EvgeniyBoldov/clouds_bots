@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="theme-color" content="#f6f7fb">
-    <title>Управление ботами — eXpress Gateway</title>
+    <title>eXpress Bot Gateway</title>
     <link rel="stylesheet" href="/static/admin.css">
     <script src="/static/admin.js" defer></script>
   </head>
@@ -27,7 +27,7 @@
 
     <div id="admin-view" class="app-shell" hidden>
       <header class="topbar">
-        <a class="brand" href="#bots" aria-label="eXpress Gateway — боты">
+        <a class="brand" href="#botx" aria-label="eXpress Gateway — BotX">
           <span class="brand-mark" aria-hidden="true">e</span><span>eXpress Gateway</span>
         </a>
         <div class="topbar-right">
@@ -39,100 +39,244 @@
         <aside class="sidebar">
           <div class="sidebar-heading">Управление</div>
           <nav aria-label="Разделы панели">
-            <button class="side-link active" type="button" data-section="bots" aria-current="page"><span class="nav-icon" aria-hidden="true">▦</span><span>Боты</span><span id="bot-count" class="nav-count">—</span></button>
-            <button class="side-link" type="button" data-section="templates"><span class="nav-icon" aria-hidden="true">◇</span><span>Типы ботов</span><span id="template-count" class="nav-count">—</span></button>
-            <button class="side-link" type="button" data-section="grants"><span class="nav-icon" aria-hidden="true">♙</span><span>Доступы</span><span id="grant-count" class="nav-count">—</span></button>
+            <button class="side-link active" type="button" data-section="botx" aria-current="page"><span class="nav-icon" aria-hidden="true">▦</span><span>BotX</span><span id="bot-count" class="nav-count">—</span></button>
+            <button class="side-link" type="button" data-section="bots"><span class="nav-icon" aria-hidden="true">◇</span><span>Внутренние боты</span></button>
+            <button class="side-link" type="button" data-section="integrations"><span class="nav-icon" aria-hidden="true">⇄</span><span>Внешние системы</span></button>
           </nav>
           <div class="sidebar-note"><span class="live-dot"></span>Подключено к сервису<small>Административный доступ</small></div>
         </aside>
         <main class="main-content">
           <div class="page-layout">
             <div class="page-heading">
-              <div><div class="eyebrow">УПРАВЛЕНИЕ СЕРВИСОМ</div><h1 id="page-title">Боты</h1><p id="page-description">Подключённые боты и их конфигурация.</p></div>
-              <button id="refresh-button" class="button button-quiet" type="button"><span aria-hidden="true">↻</span> Обновить</button>
+              <div><div class="eyebrow">УПРАВЛЕНИЕ СЕРВИСОМ</div><h1 id="page-title">BotX</h1><p id="page-description">Подключения к eXpress и обработчики входящих сообщений.</p></div>
+              <div class="page-actions">
+                <button id="refresh-button" class="button button-quiet" type="button"><span aria-hidden="true">↻</span> Обновить</button>
+                <button id="create-button" class="button button-primary" type="button" aria-haspopup="dialog" aria-controls="create-botx">Создать</button>
+              </div>
             </div>
             <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
 
-            <section id="bots-section" class="section-stack" aria-labelledby="bots-heading">
-              <section class="panel">
-                <div class="panel-heading"><div><h2 id="add-bot-heading">Подключить BotX</h2><p>Добавьте учётные данные нового бота в шлюз.</p></div></div>
-                <form id="bot-form" class="bot-form">
-                  <div class="form-field">
-                    <label class="field-label" for="bot-id">Bot ID</label>
-                    <input id="bot-id" name="bot_id" placeholder="UUID бота" autocomplete="off" required>
-                  </div>
-                  <div class="form-field">
-                    <label class="field-label" for="bot-cts-url">CTS URL</label>
-                    <input id="bot-cts-url" name="cts_url" type="url" placeholder="https://…" autocomplete="url" required>
-                  </div>
-                  <div class="form-field">
-                    <label class="field-label" for="bot-secret-key">Secret key</label>
-                    <input id="bot-secret-key" name="secret_key" type="password" autocomplete="new-password" required>
-                  </div>
-                  <div class="form-field">
-                    <label class="field-label" for="bot-name">Название</label>
-                    <input id="bot-name" name="name" maxlength="200" autocomplete="organization-title" required>
-                  </div>
-                  <div class="form-field form-field-wide">
-                    <label class="field-label" for="bot-template">Тип бота</label>
-                    <select id="bot-template" name="template_id" required disabled>
-                      <option value="">Загрузка каталога…</option>
-                    </select>
-                    <small class="field-help">Тип определяет доступные команды и обработчики этого BotX.</small>
-                  </div>
-                  <div class="form-actions"><button class="button button-primary" type="submit" disabled>Подключить бота</button></div>
-                </form>
-              </section>
+            <section id="botx-section" class="section-stack" aria-labelledby="bots-heading">
               <section class="panel" aria-labelledby="bots-heading">
-                <div class="panel-heading"><div><h2 id="bots-heading">Подключённые боты</h2><p>Боты, настроенные для этого шлюза.</p></div><span id="bots-badge" class="count-badge">0</span></div>
+                <div class="panel-heading">
+                  <div><h2 id="bots-heading">Подключения BotX</h2><p>Подключённые обработчики и внешние системы.</p></div>
+                  <div class="list-actions">
+                    <span id="bots-badge" class="count-badge">0</span>
+                    <button type="button" class="button button-quiet help-icon" data-help-section="botx" aria-label="Справка по подключениям BotX" aria-haspopup="dialog" title="Справка">?</button>
+                  </div>
+                </div>
                 <div id="bots-list" class="data-list" aria-live="polite"></div>
               </section>
             </section>
 
-            <section id="templates-section" class="panel" hidden aria-labelledby="templates-heading">
-              <div class="panel-heading">
-                <div><h2 id="templates-heading">Типы ботов</h2><p>Зарегистрированные шаблоны, их команды и подключённые BotX аккаунты.</p></div>
-                <span id="templates-badge" class="count-badge">0</span>
-              </div>
-              <div id="templates-list" class="template-grid" aria-live="polite"></div>
-            </section>
-
-            <section id="grants-section" class="grants-layout" hidden aria-labelledby="grants-heading">
-              <section class="panel">
-                <div class="panel-heading"><div><h2 id="grants-heading">Разрешить доступ</h2><p>Выберите бота и укажите идентификатор пользователя eXpress.</p></div></div>
-                <form id="grant-form">
-                  <div class="form-field">
-                    <label class="field-label" for="grant-bot">Бот</label>
-                    <select id="grant-bot" name="bot_id" required><option value="">Загрузка списка…</option></select>
-                  </div>
-                  <div class="form-field">
-                    <label class="field-label" for="grant-identity-type">Тип идентификатора</label>
-                    <select id="grant-identity-type" name="identity_type" required>
-                      <option value="email">Email</option>
-                      <option value="ad">AD аккаунт</option>
-                      <option value="huid">HUID</option>
-                    </select>
-                  </div>
-                  <div class="form-field">
-                    <label class="field-label" for="grant-identity" id="grant-identity-label">Email</label>
-                    <input id="grant-identity" name="identity" placeholder="user@example.com" autocomplete="off" required>
-                  </div>
-                  <div id="ad-domain-field" class="conditional-field" hidden>
-                    <label class="field-label" for="grant-ad-domain">AD домен</label>
-                    <input id="grant-ad-domain" name="ad_domain" placeholder="company.example" autocomplete="off">
-                  </div>
-                  <div class="form-actions"><button class="button button-primary" type="submit">Выдать доступ</button><span class="muted">Разрешение: use</span></div>
-                </form>
-              </section>
-              <section class="panel">
-                <div class="panel-heading"><div><h2>Выданные доступы</h2><p>Разрешения пользователей по ботам.</p></div><span id="grants-badge" class="count-badge">0</span></div>
-                <div id="grants-list" class="data-list" aria-live="polite"></div>
+            <section id="bots-section" class="section-stack" hidden aria-labelledby="internal-heading">
+              <section class="panel" aria-labelledby="internal-heading">
+                <div class="panel-heading">
+                  <div><h2 id="internal-heading">Внутренние боты</h2><p>В группах боты отвечают на команды, упоминания и ответы на свои сообщения.</p></div>
+                  <button type="button" class="button button-quiet help-icon" data-help-section="bots" aria-label="Справка по внутренним ботам" aria-haspopup="dialog" title="Справка">?</button>
+                </div>
+                <div id="internal-bots-list" class="data-list"></div>
               </section>
             </section>
-            <footer id="page-footer" class="page-footer">Доступы ограничивают использование персонального бота. Вызовы бота в группах доступны участникам чата.</footer>
+            <section id="integrations-section" class="section-stack" hidden aria-labelledby="integrations-heading">
+              <section class="panel">
+                <div class="panel-heading">
+                  <div><h2 id="integrations-heading">Внешние системы</h2><p>Отправляйте сообщения через <code>POST /api/v1/messages</code> с полями <code>bot_id</code>, <code>chat_id</code> и <code>text</code>.</p></div>
+                  <button type="button" class="button button-quiet help-icon" data-help-section="integrations" aria-label="Справка по внешним системам" aria-haspopup="dialog" title="Справка">?</button>
+                </div>
+                <div id="integrations-list" class="data-list" aria-live="polite"></div>
+              </section>
+            </section>
           </div>
         </main>
       </div>
+      <dialog id="create-botx" class="panel create-dialog" aria-labelledby="create-botx-heading">
+        <div class="panel-heading"><div><h2 id="create-botx-heading">Подключить BotX</h2><p>Добавьте учётные данные нового бота в шлюз.</p></div></div>
+        <form id="bot-form" class="bot-form">
+          <div class="form-field">
+            <label class="field-label" for="bot-id">Bot ID</label>
+            <input autofocus id="bot-id" name="bot_id" placeholder="UUID бота" autocomplete="off" required>
+          </div>
+          <div class="form-field">
+            <label class="field-label" for="bot-cts-url">CTS URL</label>
+            <input id="bot-cts-url" name="cts_url" type="url" placeholder="https://…" autocomplete="url" required>
+          </div>
+          <div class="form-field" id="bot-secret-field">
+            <label class="field-label" for="bot-secret-key">Secret key</label>
+            <input id="bot-secret-key" name="secret_key" type="password" autocomplete="new-password" required>
+          </div>
+          <div class="form-field">
+            <label class="field-label" for="bot-name">Название</label>
+            <input id="bot-name" name="name" maxlength="200" autocomplete="organization-title" required>
+          </div>
+          <p class="create-error" role="alert" hidden></p>
+          <div class="form-actions modal-actions">
+            <button class="button button-quiet" type="button" data-close-dialog>Отмена</button>
+            <button class="button button-primary" type="submit">Подключить</button>
+          </div>
+        </form>
+      </dialog>
+      <dialog id="create-internal-bot" class="panel create-dialog" aria-labelledby="create-internal-bot-heading">
+        <div class="panel-heading"><div><h2 id="create-internal-bot-heading">Новый внутренний бот</h2><p>Выберите тип бота и подключение, через которое он будет получать сообщения.</p></div></div>
+        <form id="internal-bot-form" class="bot-form">
+          <div class="form-field">
+            <label class="field-label" for="internal-name">Название</label>
+            <input autofocus id="internal-name" name="name" maxlength="200" required>
+          </div>
+          <div class="form-field">
+            <label class="field-label" for="bot-template">Тип бота</label>
+            <select id="bot-template" name="template_id" required></select>
+          </div>
+          <div class="form-field form-field-wide">
+            <label class="field-label" for="internal-botx">Подключение BotX</label>
+            <select id="internal-botx" name="botx_id" required></select>
+          </div>
+          <div class="check-fields form-field-wide">
+            <label><input type="checkbox" name="groups_enabled" checked> Обрабатывать групповые чаты</label>
+            <label><input type="checkbox" name="group_history_enabled" checked> Сохранять историю групп</label>
+          </div>
+          <p class="create-error" role="alert" hidden></p>
+          <div class="form-actions modal-actions">
+            <button class="button button-quiet" type="button" data-close-dialog>Отмена</button>
+            <button class="button button-primary" type="submit">Создать бота</button>
+          </div>
+        </form>
+      </dialog>
+      <dialog id="create-integration" class="panel create-dialog" aria-labelledby="create-integration-heading">
+        <div class="panel-heading"><div><h2 id="create-integration-heading">Новая внешняя система</h2><p>Укажите, какая система отправляет уведомления, кому и зачем они нужны.</p></div></div>
+        <form id="integration-form" class="bot-form">
+          <div class="form-field">
+            <label class="field-label" for="integration-name">Система</label>
+            <input autofocus id="integration-name" name="name" maxlength="200" required>
+          </div>
+          <div class="form-field form-field-wide">
+            <label class="field-label" for="integration-description">Получатели и назначение</label>
+            <textarea id="integration-description" name="description" rows="3" maxlength="4000" placeholder="Например, команда эксплуатации получает сообщения о сбоях мониторинга" required></textarea>
+          </div>
+          <fieldset class="route-settings form-field-wide">
+            <legend>Маршруты отправки</legend>
+            <div id="integration-routes" class="data-list"></div>
+            <button class="button button-quiet" type="button" id="add-integration-route">Добавить BotX</button>
+          </fieldset>
+          <p class="create-error" role="alert" hidden></p>
+          <div class="form-actions modal-actions">
+            <button class="button button-quiet" type="button" data-close-dialog>Отмена</button>
+            <button class="button button-primary" type="submit">Добавить систему</button>
+          </div>
+        </form>
+      </dialog>
+      <dialog id="grant-dialog" class="panel create-dialog" aria-labelledby="grant-dialog-heading">
+        <div class="panel-heading"><div><h2 id="grant-dialog-heading">Выдать доступ</h2><p>Для поиска по email или AD боту нужен подключённый BotX.</p></div></div>
+        <form id="grant-form" class="bot-form">
+          <div class="form-field">
+            <label class="field-label" for="grant-identity-type">Тип идентификатора</label>
+            <select id="grant-identity-type" name="identity_type" required>
+              <option value="email">Email</option>
+              <option value="ad">AD аккаунт</option>
+              <option value="huid">HUID</option>
+            </select>
+          </div>
+          <div class="form-field">
+            <label class="field-label" for="grant-identity" id="grant-identity-label">Email</label>
+            <input id="grant-identity" name="identity" placeholder="user@example.com" autocomplete="off" required>
+          </div>
+          <div id="ad-domain-field" class="conditional-field" hidden>
+            <label class="field-label" for="grant-ad-domain">AD домен</label>
+            <input id="grant-ad-domain" name="ad_domain" placeholder="company.example" autocomplete="off">
+          </div>
+          <p class="create-error" role="alert" hidden></p>
+          <div class="form-actions modal-actions">
+            <button class="button button-quiet" type="button" data-close-dialog>Отмена</button>
+            <button class="button button-primary" type="submit">Выдать доступ</button>
+          </div>
+        </form>
+      </dialog>
+      <dialog id="token-dialog" class="panel create-dialog" aria-labelledby="token-dialog-heading">
+        <div class="panel-heading">
+          <div>
+            <h2 id="token-dialog-heading">Выпустить токен</h2>
+            <p id="token-system-name"></p>
+          </div>
+        </div>
+        <p class="field-help">Передавайте токен в заголовке <code>X-Notification-Token</code>. Полный токен можно скопировать сразу после выпуска.</p>
+        <div id="issued-token-result" class="form-field" hidden>
+          <label class="field-label" for="issued-token">Токен</label>
+          <input id="issued-token" class="mono" readonly autocomplete="off">
+        </div>
+        <p id="token-dialog-message" class="message" role="status" aria-live="polite"></p>
+        <div class="form-actions modal-actions token-actions">
+          <button id="close-token-dialog" class="button button-quiet" type="button">Отмена</button>
+          <button id="confirm-issue-token" class="button button-primary" type="button">Выпустить токен</button>
+          <button id="copy-issued-token" class="button button-primary" type="button" hidden>Скопировать</button>
+        </div>
+      </dialog>
+      <dialog id="help-dialog" class="panel create-dialog help-dialog" aria-labelledby="help-heading">
+        <div class="panel-heading"><h2 id="help-heading">Справка</h2></div>
+        <div id="help-content" class="help-content"></div>
+        <form method="dialog" class="form-actions modal-actions">
+          <button class="button button-quiet" type="submit">Закрыть</button>
+        </form>
+      </dialog>
+
+      <template id="help-botx">
+        <section>
+          <h3>Проверка подключения BotX</h3>
+          <ol>
+            <li>На стороне CTS проверьте, что в карточке бота указан адрес шлюза, доступный из сети CTS, и выбрана версия протокола <strong>4</strong>. Сверьте UUID бота и секретный ключ с данными подключения.</li>
+            <li>В карточке BotX нажмите <strong>Проверить</strong>. Шлюз запросит у CTS <code>GET /api/v3/botx/chats/list</code> от имени бота и покажет число доступных чатов. Даже пустой список подтверждает доступ к API. Эта проверка не отправляет сообщений.</li>
+            <li>Для проверки пути <strong>из CTS в шлюз</strong> напишите боту в клиенте eXpress. Для подключённого внутреннего бота типа Echo отправьте <code>/ping</code> в личном чате, где вам выдан доступ. Ответ <code>pong</code> подтверждает входящий запрос, обработку и обратную отправку.</li>
+            <li>Если подключение используется только для отправки, пошлите уведомление в тестовый чат по инструкции внешней системы и проверьте результат в журнале доставки.</li>
+          </ol>
+        </section>
+        <section>
+          <h3>Какие адреса проверять</h3>
+          <dl>
+            <dt><code>GET /health/ready</code> на шлюзе</dt><dd>Проверяет доступ шлюза к базе. До CTS запрос не доходит.</dd>
+            <dt><code>GET /status</code> на шлюзе</dt><dd>Запрос eXpress для статуса и меню команд. Ответ на ручной запрос к URL сам по себе не подтверждает прохождение сообщений.</dd>
+            <dt><code>POST /command</code> и <code>POST /notification/callback</code> на шлюзе</dt><dd>Подписанные запросы от CTS для входящих событий и результатов отправки.</dd>
+          </dl>
+        </section>
+        <p><a href="https://docs.express.ms/server-operation/cts/chatbots-smartapp/chat-bots/connecting/" target="_blank" rel="noopener noreferrer">Подключение чат-бота</a> · <a href="https://docs.express.ms/chatbots/developer-guide/api/bot-api/" target="_blank" rel="noopener noreferrer">Bot API</a> · <a href="https://docs.express.ms/chatbots/developer-guide/api/botx-api/chats-api/" target="_blank" rel="noopener noreferrer">Chats API</a></p>
+      </template>
+
+      <template id="help-bots">
+        <section>
+          <h3>Как проверить внутреннего бота</h3>
+          <ol>
+            <li>Свяжите бота с подключением BotX. Для личного чата выдайте себе доступ из карточки бота.</li>
+            <li>Для бота типа Echo отправьте <code>/ping</code> в личном чате. Ожидаемый ответ — <code>pong</code>. Для других типов выберите команду из блока «Команды» в карточке или отправьте сообщение и проверьте ожидаемую реакцию.</li>
+            <li>Для проверки группы включите обработку групп, добавьте бота в тестовый чат, затем упомяните его или ответьте на его сообщение. Чтобы eXpress передавал обычные сообщения для истории, укажите <code>allowed_data=all</code> в настройках бота на CTS.</li>
+          </ol>
+          <p>Входящие сообщения клиента приходят через BotX. Уведомления внешней системы идут прямо в указанный чат и не вызывают обработчик внутреннего бота.</p>
+          <p><a href="https://express.ms/faq/bots-and-smartapps/creating-bots-and-smartapps/" target="_blank" rel="noopener noreferrer">Как eXpress передаёт сообщения боту</a></p>
+        </section>
+      </template>
+
+      <template id="help-integrations">
+        <section>
+          <h3>Отправить уведомление</h3>
+          <p>Выпустите токен для системы. Используйте адрес шлюза, доступный отправителю, UUID BotX из маршрута и UUID чата, в который бот может писать.</p>
+          <label class="field-label" data-help-integration hidden>Внешняя система для примера<select data-help-system></select></label>
+          <label class="field-label" data-help-route hidden>BotX для примера<select data-help-bot></select></label>
+          <p class="field-help" data-help-no-routes hidden>Добавьте маршрут через BotX в настройках системы перед отправкой.</p>
+          <pre><code data-help-send></code></pre>
+          <dl>
+            <dt><code>bot_id</code></dt><dd>UUID подключения BotX из маршрута системы.</dd>
+            <dt><code>chat_id</code></dt><dd>UUID целевого чата eXpress.</dd>
+            <dt><code>text</code></dt><dd>Текст уведомления. Пустая строка и строка из пробелов недопустимы.</dd>
+          </dl>
+          <p>Шлюз вернёт <code>202 Accepted</code> и тело <code>{"job_id":123,"status":"pending"}</code>, когда сохранит задачу в очередь.</p>
+        </section>
+        <section>
+          <h3>Проверить доставку</h3>
+          <pre><code>curl -sS "$GATEWAY_URL/api/v1/messages/123" \
+  -H "X-Notification-Token: $INTEGRATION_TOKEN"</code></pre>
+          <p>Подставьте полученный <code>job_id</code>. Ответ содержит <code>job_id</code>, <code>status</code> и <code>attempts</code>. <code>pending</code> означает ожидание, <code>processing</code> — отправку, <code>completed</code> — подтверждение от BotX, <code>failed</code> — неудачу после трёх попыток. Те же статусы видны в журнале системы.</p>
+          <p><code>401</code> — токен отсутствует, неверен или отозван. <code>403</code> — отправка через этот BotX или в этот чат не разрешена. <code>404</code> — подключение недоступно или задача недоступна для этого токена. <code>422</code> — неверный формат запроса.</p>
+          <p>Пути <code>/api/v1/notifications</code> и <code>/api/v1/notifications/{job_id}</code> принимают тот же формат. Каждый POST создаёт отдельную задачу.</p>
+        </section>
+      </template>
+
       <footer class="app-footer">eXpress Bot Gateway <span aria-hidden="true">·</span> Административная панель</footer>
     </div>
   </body>

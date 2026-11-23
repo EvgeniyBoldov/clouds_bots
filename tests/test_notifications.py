@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.ext.compiler import compiles
 
 from gateway import main
-from gateway.models import Base, Bot, Job
+from gateway.models import Base, Bot, InternalBot, Job
 
 
 @compiles(JSONB, "sqlite")
@@ -39,6 +39,8 @@ async def test_notifications_are_queued_and_forwarded_after_incoming_jobs(monkey
                 Bot(id=bot_id, name="test", cts_url="https://cts.example.org", secret_key="bot-secret"),
                 Bot(id=disabled_id, name="disabled", enabled=False),
             ])
+            await session.flush()
+            session.add(InternalBot(botx_id=bot_id, name="test handler"))
             incoming = Job(bot_id=bot_id, chat_id=chat_id, payload={"kind": "message"})
             session.add(incoming)
         monkeypatch.setattr(main, "dispatch_queued_message", AsyncMock(return_value="reply"))

@@ -1,6 +1,6 @@
 # eXpress Bot Gateway
 
-FastAPI/PostgreSQL gateway for eXpress BotX. Register bot accounts in the admin page; credentials are stored in PostgreSQL and loaded into pybotx's runtime account provider. Secrets are never returned by the admin API. User grants are scoped to a bot. Group mentions are callable by any participant; grants restrict personal bot access.
+FastAPI/PostgreSQL gateway for eXpress BotX. Register bot accounts in the admin page; credentials are stored in PostgreSQL and loaded into pybotx's runtime account provider. BotX credentials stay on the server. User grants are scoped to an internal bot. Group mentions are callable by any participant; grants restrict personal bot access.
 
 ## Run
 
@@ -19,24 +19,26 @@ Open `/` for the admin page and sign in with `GATEWAY_ADMIN_TOKEN`. The admin pa
 
 The main app mounts the documented pybotx routes and runs a PostgreSQL polling worker that sends queued notification messages via `Bot.send_message`. `gateway.bot` supplies the shared collector and Bot instance.
 
-## Send notifications
+## Send messages and notifications
 
-Set `GATEWAY_NOTIFICATION_TOKEN` in the gateway environment and pass it in `X-Notification-Token` from your sending service. The token grants access to the notification API for all connected bots. Existing callers can continue using `X-Admin-Token` or an admin session.
+In **Внешние системы**, register the sender and add routes through its allowed BotX connections in the same form. New routes allow sending to any chat reachable by the selected BotX. Existing chat allowlists are preserved. Issue a system token, copy it when shown, and store it in the sending service's secret store. New tokens work across the system's configured routes. Tokens issued before this split still work only with their original BotX. The system card shows token prefixes, routes, and delivery results.
+
+Existing callers can still use the environment-wide `GATEWAY_NOTIFICATION_TOKEN`, `X-Admin-Token` or an admin session. The environment-wide token still works across connected bots.
 
 ```sh
-curl -X POST "$GATEWAY_URL/api/v1/notifications" \
-  -H "X-Notification-Token: $GATEWAY_NOTIFICATION_TOKEN" \
+curl -X POST "$GATEWAY_URL/api/v1/messages" \
+  -H "X-Notification-Token: $INTEGRATION_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"bot_id":"123e4567-e89b-12d3-a456-426655440000","chat_id":"123e4567-e89b-12d3-a456-426655440001","text":"Deployment complete"}'
 ```
 
 Use the UUID of a connected bot and the UUID of a chat the bot can send to. The gateway returns `202 Accepted` with `{"job_id":123,"status":"pending"}` after saving the job. The worker sends the message through BotX using the registered bot's credentials.
 
-Use `GET /api/v1/notifications/123` with the same token to read the current `status` and number of `attempts`. `completed` means BotX confirmed the send. `failed` means all three attempts failed. Each POST creates a new job. If BotX accepts a message but its confirmation times out, a worker retry can send it again.
+Use `GET /api/v1/messages/123` with the same token to read the current `status` and number of `attempts`. `completed` means BotX confirmed the send. `failed` means all three attempts failed. The existing `/api/v1/notifications` URLs still work. Each POST creates a new job. If BotX accepts a message but its confirmation times out, a worker retry can send it again.
 
 ## Bot behavior templates
 
-Each database bot account stores a `template_id`. The admin page lists the templates registered by trusted application code and binds one to each BotX account. The incoming BotX request is authenticated by pybotx; the worker uses the verified bot id to load its database record and dispatches the message to that record's template. The admin API accepts only a registered template id and cannot import arbitrary Python modules.
+Each internal bot stores a `template_id`. Create the bot and select its BotX connection under **Внутренние боты**. Grant users personal chat access in the same section. A connection without a handler can send messages through outbound routes. The incoming BotX request is authenticated by pybotx; the worker uses the verified BotX id to find the linked internal bot and dispatch the message to its template. The admin API accepts only a registered template id and cannot import arbitrary Python modules.
 
 The built-in `echo` template replies to ordinary text, provides `/help`, and answers `/ping` with `pong`. To add behavior, create a module such as `src/gateway/custom_templates.py`:
 
@@ -72,4 +74,4 @@ The admin UI grants a user `use` access per bot. Email addresses resolve through
 
 Production release and deployment instructions: [docs/deployment.md](docs/deployment.md).
 
-Group message delivery depends on the eXpress bot card: add the bot to the chat and set the available message types (`allowed_data`) to `all`. The gateway stores received group messages when chat history is enabled. Templates can override `on_group_message` to inspect ordinary group messages (it returns nothing by default), `on_mention` for structured bot mentions, and `on_reply` for replies whose `reply.author_id` matches the bot ID; decorated commands take priority. `HandlerRequest.metadata` contains `is_mentioned`, `is_reply_to_bot`, and the reply's author, message ID and body. Direct messages continue to use `on_message`. The platform only delivers messages permitted by its bot settings; it does not provide earlier chat history through this handler.
+Group message delivery depends on the eXpress bot card: add the bot to the chat and set the available message types (`allowed_data`) to `all`. The gateway stores received group messages when group history is enabled for the internal bot and the chat has history enabled. Templates can override `on_group_message` to inspect ordinary group messages (it returns nothing by default), `on_mention` for structured bot mentions, and `on_reply` for replies whose `reply.author_id` matches the bot ID; decorated commands take priority. `HandlerRequest.metadata` contains `is_mentioned`, `is_reply_to_bot`, and the reply's author, message ID and body. Direct messages continue to use `on_message`. The platform only delivers messages permitted by its bot settings; it does not provide earlier chat history through this handler.
