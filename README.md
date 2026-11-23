@@ -9,7 +9,7 @@ cp .env.example .env
 docker compose up --build
 ```
 
-Open `/` for the admin page and sign in with `GATEWAY_ADMIN_TOKEN`. The admin page uses a 12-hour HttpOnly session cookie. Set `GATEWAY_ADMIN_COOKIE_SECURE=true` when HTTPS terminates before this service so browsers send the cookie only over HTTPS; it defaults to `false` for the included HTTP Compose setup. Existing API integrations can continue using `X-Admin-Token`. Health endpoints: `/health/`, `/health/ready`. The authorized notification endpoint is `POST /api/v1/notifications`.
+Open `/` for the admin page and sign in with `GATEWAY_ADMIN_TOKEN`. The admin page uses a 12-hour HttpOnly session cookie. Set `GATEWAY_ADMIN_COOKIE_SECURE=true` when HTTPS terminates before this service so browsers send the cookie only over HTTPS; it defaults to `false` for the included HTTP Compose setup. Existing API integrations can continue using `X-Admin-Token`. Health endpoints are `/health/` and `/health/ready`.
 
 `GATEWAY_BOT_ACCOUNTS_JSON` is supported only as a legacy startup import. Add new bot accounts from the admin page with the `bot_id`, `cts_url`, `secret_key`, and name issued when the bot is registered in the eXpress admin console.
 
@@ -18,6 +18,21 @@ Open `/` for the admin page and sign in with `GATEWAY_ADMIN_TOKEN`. The admin pa
 `src/gateway/bot.py` uses pybotx's `BotAccountProvider` snapshot so newly registered credentials apply without restarting the process. It persists authorized personal messages, deduplicates events, answers personal chats, and routes group messages to the selected template, with default replies for structured contact mentions, replies to the bot, and slash commands. Group calls are open to all users. Use `allowed_data=all` in eXpress admin.
 
 The main app mounts the documented pybotx routes and runs a PostgreSQL polling worker that sends queued notification messages via `Bot.send_message`. `gateway.bot` supplies the shared collector and Bot instance.
+
+## Send notifications
+
+Set `GATEWAY_NOTIFICATION_TOKEN` in the gateway environment and pass it in `X-Notification-Token` from your sending service. The token grants access to the notification API for all connected bots. Existing callers can continue using `X-Admin-Token` or an admin session.
+
+```sh
+curl -X POST "$GATEWAY_URL/api/v1/notifications" \
+  -H "X-Notification-Token: $GATEWAY_NOTIFICATION_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"bot_id":"123e4567-e89b-12d3-a456-426655440000","chat_id":"123e4567-e89b-12d3-a456-426655440001","text":"Deployment complete"}'
+```
+
+Use the UUID of a connected bot and the UUID of a chat the bot can send to. The gateway returns `202 Accepted` with `{"job_id":123,"status":"pending"}` after saving the job. The worker sends the message through BotX using the registered bot's credentials.
+
+Use `GET /api/v1/notifications/123` with the same token to read the current `status` and number of `attempts`. `completed` means BotX confirmed the send. `failed` means all three attempts failed. Each POST creates a new job. If BotX accepts a message but its confirmation times out, a worker retry can send it again.
 
 ## Bot behavior templates
 

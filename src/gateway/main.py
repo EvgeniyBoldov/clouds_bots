@@ -8,9 +8,10 @@ from pathlib import Path
 from typing import Literal
 
 from fastapi import FastAPI, Depends, Header, HTTPException, Request
+from fastapi import Path as PathParam
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi import Response
-from pydantic import AnyHttpUrl, BaseModel, Field
+from pydantic import AnyHttpUrl, BaseModel, Field, field_validator
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 from pybotx import FastAPIBotAppConfig, setup_fastapi_bot
@@ -225,28 +226,34 @@ async def process_jobs(bot_client):
                     job.status = "processing"
                     job.attempts += 1
                     job_id, bot_id, chat_id, payload = job.id, job.bot_id, job.chat_id, job.payload
-            if job:
-                try:
-                    if payload.get("kind") in {"summary", "message"}:
-                        bot_record = await session.get(Bot, bot_id)
-                        if bot_record is None:
-                            raise RuntimeError("bot record not found for queued message")
-                        output = await dispatch_queued_message(bot_record, bot_id, chat_id, payload)
-                    else:
-                        output = payload["text"]
-                    if output:
-                        await asyncio.wait_for(bot_client.send_message(bot_id=bot_id, chat_id=chat_id, body=output), timeout=20)
-                except Exception:
-                    async with session.begin():
-                        failed = await session.get(Job, job_id)
-                        if failed:
-                            failed.status = "pending" if failed.attempts < 3 else "failed"
-                else:
-                    async with session.begin():
-                        completed = await session.get(Job, job_id)
-                        if completed: completed.status = "completed"
-            else:
+                    attempts = job.attempts
+            if job is None:
                 await asyncio.sleep(settings.worker_poll_seconds)
+                continue
+
+            try:
+                if payload.get("kind") in {"summary", "message"}:
+                    async with session.begin():
+                        bot_record = await session.get(Bot, bot_id)
+                    if bot_record is None:
+                        raise RuntimeError("bot record not found for queued message")
+                    output = await dispatch_queued_message(bot_record, bot_id, chat_id, payload)
+                else:
+                    output = payload["text"]
+                if output:
+                    await asyncio.wait_for(
+                        bot_client.send_message(bot_id=bot_id, chat_id=chat_id, body=output),
+                        timeout=20,
+                    )
+            except Exception:
+                status = "pending" if attempts < 3 else "failed"
+            else:
+                status = "completed"
+
+            async with session.begin():
+                record = await session.get(Job, job_id)
+                if record:
+                    record.status = status
 
 
 ADMIN_SESSION_COOKIE = "gateway_admin_session"
@@ -263,7 +270,7 @@ def _session_signature(timestamp: str) -> str:
 
 
 def _valid_admin_session(value: str | None) -> bool:
-    if not value:
+    if not value or not settings.admin_token:
         return False
     try:
         timestamp, signature = value.split(".", 1)
@@ -273,7 +280,7 @@ def _valid_admin_session(value: str | None) -> bool:
     now = int(time.time())
     if issued_at > now + 60 or now - issued_at > ADMIN_SESSION_TTL:
         return False
-    return hmac.compare_digest(signature, _session_signature(timestamp))
+    return _constant_time_equal(signature, _session_signature(timestamp))
 
 
 async def authorized(
@@ -582,16 +589,54 @@ async def update_chat(req: ChatSettings):
     return {"status": "updated"}
 
 
-class Notification(BaseModel): bot_id: uuid.UUID; chat_id: uuid.UUID; text: str
+async def authorized_notification(
+    request: Request,
+    x_notification_token: str | None = Header(default=None),
+    x_admin_token: str | None = Header(default=None),
+):
+    if settings.notification_token and x_notification_token and _constant_time_equal(
+        x_notification_token, settings.notification_token
+    ):
+        return
+    await authorized(request, x_admin_token)
 
 
-@app.post("/api/v1/notifications", dependencies=[Depends(authorized)], status_code=202)
+class Notification(BaseModel):
+    bot_id: uuid.UUID
+    chat_id: uuid.UUID
+    text: str
+
+    @field_validator("text")
+    @classmethod
+    def validate_text(cls, value: str) -> str:
+        if not value.strip() or "\x00" in value:
+            raise ValueError("Notification text must be non-blank and contain no null characters")
+        return value
+
+
+@app.post("/api/v1/notifications", dependencies=[Depends(authorized_notification)], status_code=202)
 async def notification(req: Notification):
-    async with Session() as s:
-        if not await s.get(Bot, req.bot_id): raise HTTPException(404, "Bot not found")
-        job = Job(bot_id=req.bot_id, chat_id=req.chat_id, payload={"text": req.text, "kind": "notification"})
-        s.add(job); await s.commit(); await s.refresh(job)
-        return {"job_id": job.id, "status": job.status}
+    async with Session.begin() as session:
+        record = await session.get(Bot, req.bot_id)
+        if not record or not record.enabled or not record.cts_url or not record.secret_key:
+            raise HTTPException(404, "Bot not found or not connected")
+        job = Job(
+            bot_id=req.bot_id,
+            chat_id=req.chat_id,
+            payload={"text": req.text, "kind": "notification"},
+        )
+        session.add(job)
+        await session.flush()
+    return {"job_id": job.id, "status": job.status}
+
+
+@app.get("/api/v1/notifications/{job_id}", dependencies=[Depends(authorized_notification)])
+async def notification_status(job_id: int = PathParam(ge=1, le=2_147_483_647)):
+    async with Session() as session:
+        job = await session.get(Job, job_id)
+        if not job or job.payload.get("kind") != "notification":
+            raise HTTPException(404, "Notification not found")
+        return {"job_id": job.id, "status": job.status, "attempts": job.attempts}
 
 
 @app.get("/metrics")
