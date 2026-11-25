@@ -24,6 +24,7 @@ from pybotx import (
     RateLimitReachedError, UnknownBotAccountError, UserNotFoundError,
 )
 from pybotx.client.exceptions.base import BaseClientError
+from pybotx.client.exceptions.http import InvalidBotXStatusCodeError
 
 from .config import settings
 from .models import (
@@ -681,13 +682,38 @@ class BotXUpdateRequest(BaseModel):
     internal_bot_id: uuid.UUID | None = None
 
 
+class BotXSecretKeyRequest(BaseModel):
+    secret_key: str = Field(min_length=1, max_length=4096)
+
+
+def validate_botx_secret_key(secret_key: str) -> None:
+    if not secret_key.strip() or "\x00" in secret_key:
+        raise HTTPException(422, "Secret key is invalid")
+
+
+@app.patch("/api/v1/admin/botx/{botx_id}/secret-key", dependencies=[Depends(authorized)], status_code=204)
+async def set_botx_secret_key(botx_id: uuid.UUID, req: BotXSecretKeyRequest):
+    validate_botx_secret_key(req.secret_key)
+    async with Session.begin() as session:
+        connection = await session.get(Bot, botx_id, with_for_update=True)
+        if connection is None:
+            raise HTTPException(404, "BotX connection not found")
+        if connection.secret_key == req.secret_key:
+            return
+        connection.secret_key = req.secret_key
+        connection.credential_revision += 1
+
+    if connection.enabled and connection.cts_url:
+        publish_botx_credentials(connection)
+
+
 @app.put("/api/v1/admin/botx/{botx_id}", dependencies=[Depends(authorized)])
 async def update_botx(botx_id: uuid.UUID, req: BotXUpdateRequest):
     name = req.name.strip()
     if not name or "\x00" in name:
         raise HTTPException(422, "BotX name is invalid")
-    if req.secret_key is not None and (not req.secret_key.strip() or "\x00" in req.secret_key):
-        raise HTTPException(422, "Secret key is invalid")
+    if req.secret_key is not None:
+        validate_botx_secret_key(req.secret_key)
 
     async with Session.begin() as session:
         connection = await session.get(Bot, botx_id, with_for_update=True)
@@ -756,6 +782,21 @@ def grant_response(grant: UserGrant) -> dict:
     }
 
 
+async def resolve_botx_user_by_email(bot_id: uuid.UUID, email: str):
+    try:
+        return await bot.search_user_by_email_post(bot_id=bot_id, email=email)
+    except (UserNotFoundError, InvalidBotXStatusCodeError) as post_error:
+        # Older CTS deployments can return 404 or 405 for the POST route.
+        if isinstance(post_error, InvalidBotXStatusCodeError) and post_error.response.status_code not in {405, 501}:
+            raise
+        try:
+            return await bot.search_user_by_email(bot_id=bot_id, email=email)
+        except InvalidBotXStatusCodeError as get_error:
+            if isinstance(post_error, UserNotFoundError) and get_error.response.status_code in {405, 501}:
+                raise post_error from get_error
+            raise
+
+
 @app.post("/api/v1/admin/grants", dependencies=[Depends(authorized)])
 async def create_grant(req: GrantRequest):
     async with Session() as s:
@@ -790,7 +831,7 @@ async def create_grant(req: GrantRequest):
                 if req.identity_type == "email":
                     if "@" not in identity or any(char.isspace() for char in identity):
                         raise HTTPException(422, "Email address is invalid")
-                    resolved_user = await bot.search_user_by_email_post(
+                    resolved_user = await resolve_botx_user_by_email(
                         bot_id=bot_record.id,
                         email=identity,
                     )

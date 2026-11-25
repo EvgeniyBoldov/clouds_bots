@@ -116,6 +116,20 @@
           </div>
         </form>
       </dialog>
+      <dialog id="botx-key-dialog" class="panel create-dialog" aria-labelledby="botx-key-heading">
+        <div class="panel-heading"><div><h2 id="botx-key-heading">Установить ключ</h2></div></div>
+        <form class="bot-form">
+          <div class="form-field">
+            <label class="field-label" for="botx-new-key">Секретный ключ BotX</label>
+            <input autofocus id="botx-new-key" name="secret_key" type="password" maxlength="4096" autocomplete="new-password" required>
+          </div>
+          <p class="create-error" role="alert" hidden></p>
+          <div class="form-actions modal-actions">
+            <button class="button button-quiet" type="button" data-close-dialog>Отмена</button>
+            <button class="button button-primary" type="submit">Сохранить ключ</button>
+          </div>
+        </form>
+      </dialog>
       <dialog id="create-internal-bot" class="panel create-dialog" aria-labelledby="create-internal-bot-heading">
         <div class="panel-heading"><div><h2 id="create-internal-bot-heading">Новый внутренний бот</h2><p>Выберите тип бота и подключение, через которое он будет получать сообщения.</p></div></div>
         <form id="internal-bot-form" class="bot-form">

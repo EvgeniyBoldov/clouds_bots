@@ -164,8 +164,13 @@
         bot.name, `/api/v1/admin/botx/${bot.bot_id}/check`, 'Проверяем доступ к CTS…',
         result => `CTS доступен. Доступных чатов: ${result.chat_count}.`,
       );
+      const key = integrationButton('Установить ключ');
+      key.id = `set-botx-key-${bot.bot_id}`;
+      key.setAttribute('aria-haspopup', 'dialog');
+      key.setAttribute('aria-controls', 'botx-key-dialog');
+      key.addEventListener('click', () => openBotxKeyDialog(bot));
       row.append(
-        recordHeading('botx', bot, check),
+        recordHeading('botx', bot, key, check),
         recordBody([
           ['Статус', state],
           ['Bot ID', integrationText('span', bot.bot_id, 'mono')],
@@ -221,6 +226,8 @@
       const template = templates.find(item => item.id === handler.template_id);
       const grant = integrationButton('Выдать доступ');
       grant.setAttribute('aria-haspopup', 'dialog');
+      grant.disabled = !connection;
+      if (!connection) grant.title = 'Свяжите внутреннего бота с BotX';
       grant.addEventListener('click', () => openGrantDialog(handler));
       card.append(
         recordHeading('bots', handler, grant),
@@ -741,7 +748,7 @@
     helpDialog.showModal();
   }
 
-  function recordHeading(section, record, extraAction) {
+  function recordHeading(section, record, ...extraActions) {
     const heading = integrationText('div', '', 'card-heading');
     const edit = integrationButton('Редактировать');
     edit.id = `edit-${section}-${dialogConfigs[section].id(record)}`;
@@ -749,8 +756,7 @@
     edit.setAttribute('aria-label', `Редактировать «${record.name}»`);
     edit.addEventListener('click', () => recordEditors[section](record, edit.id));
     const actions = integrationText('div', '', 'card-actions');
-    actions.append(edit);
-    if (extraAction) actions.append(extraAction);
+    actions.append(edit, ...extraActions);
     heading.append(integrationText('h3', record.name), actions);
     return heading;
   }
@@ -984,6 +990,23 @@
       showTokenMessage('Скопируйте выделенный токен вручную.');
     }
   });
+
+  const botxKeyDialog = document.getElementById('botx-key-dialog');
+  let keyBotId;
+  function openBotxKeyDialog(bot) {
+    keyBotId = bot.bot_id;
+    document.getElementById('botx-key-heading').textContent = `Установить ключ · ${bot.name}`;
+    botxKeyDialog.showModal();
+  }
+  bindFormDialog(botxKeyDialog, async form => {
+    const botId = keyBotId;
+    const secretKey = new FormData(form).get('secret_key');
+    await api(`/api/v1/admin/botx/${botId}/secret-key`, {
+      method: 'PATCH',
+      body: JSON.stringify({ secret_key: secretKey }),
+    });
+    return { message: 'Ключ BotX сохранён.', focusId: `set-botx-key-${botId}` };
+  }, loadTopology);
 
   const grantDialog = document.getElementById('grant-dialog');
   let grantBotId;
