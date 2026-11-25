@@ -1,6 +1,41 @@
 from dataclasses import dataclass, field
-from typing import Protocol
+from typing import Literal, Protocol
 import httpx
+
+
+ExternalAuthType = Literal["none", "bearer", "api_key", "token", "basic"]
+
+
+@dataclass(frozen=True)
+class ExternalSystem:
+    id: int
+    name: str
+    url: str
+    auth_type: ExternalAuthType
+    _token: str | None = field(repr=False)
+
+    async def request(
+        self,
+        method: str,
+        *,
+        params: httpx.QueryParams | dict | None = None,
+        json: object = None,
+    ) -> httpx.Response:
+        """Send a request to the configured HTTPS endpoint."""
+        headers = {}
+        if self.auth_type != "none":
+            if self._token is None:
+                raise RuntimeError("External system token is missing")
+            if self.auth_type == "api_key":
+                headers["X-API-Key"] = self._token
+            else:
+                headers["Authorization"] = f"{self.auth_type.title()} {self._token}"
+        url = httpx.URL(self.url)
+        if params is not None:
+            url = url.copy_merge_params(params)
+        async with httpx.AsyncClient(timeout=10, follow_redirects=False) as client:
+            response = await client.request(method, url, headers=headers, json=json)
+            return response.raise_for_status()
 
 
 @dataclass
@@ -14,6 +49,7 @@ class HandlerRequest:
     command: str | None = None
     metadata: dict = field(default_factory=dict)
     context: list[dict] = field(default_factory=list)
+    external_system: ExternalSystem | None = field(default=None, repr=False)
 
 
 @dataclass

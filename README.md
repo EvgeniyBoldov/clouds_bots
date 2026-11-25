@@ -36,6 +36,24 @@ Use the UUID of a connected bot and the UUID of a chat the bot can send to. The 
 
 Use `GET /api/v1/messages/123` with the same token to read the current `status` and number of `attempts`. `completed` means BotX confirmed the send. `failed` means all three attempts failed. The existing `/api/v1/notifications` URLs still work. Each POST creates a new job. If BotX accepts a message but its confirmation times out, a worker retry can send it again.
 
+## Requests from bots to external systems
+
+Under **Внешние системы**, set the HTTPS address of the API endpoint on port 443. Select an authentication type and enter the API token if needed. Bearer, Token and Basic use the corresponding `Authorization` scheme. For Basic, enter the Base64-encoded `username:password`. An API key uses `X-API-Key`. Leave the token field blank when editing to keep the saved token, or select **Без авторизации** to clear it. The **Проверить связь** button checks TCP connectivity to the saved host on port 443 from the gateway. The check ends before TLS or HTTP.
+
+In **Внутренние боты**, select the external system for the bot. The link is independent of notification routes, so a system can support either direction or both. A template receives the linked endpoint as `request.external_system` when the system has an address. Call `request.external_system.request(method, params=..., json=...)` to send an authenticated request to that endpoint. The helper returns an HTTP response for a successful status and raises an HTTPX exception for network errors or unsuccessful statuses. It verifies TLS and disables redirects. A failed job can retry the template, so use an idempotency identifier in the payload for operations with side effects.
+
+Example command in a registered template:
+
+```python
+@command("/status", "Запросить состояние внешней системы")
+async def status(self, request: HandlerRequest) -> str:
+    system = request.external_system
+    if system is None:
+        return "Внешняя система не настроена."
+    response = await system.request("GET", params={"check": "status"})
+    return str(response.json()["status"])
+```
+
 ## Bot behavior templates
 
 Each internal bot stores a `template_id`. Create the bot and select its BotX connection under **Внутренние боты**. Grant users personal chat access in the same section. A connection without a handler can send messages through outbound routes. The incoming BotX request is authenticated by pybotx; the worker uses the verified BotX id to find the linked internal bot and dispatch the message to its template. The admin API accepts only a registered template id and cannot import arbitrary Python modules.

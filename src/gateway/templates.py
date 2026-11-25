@@ -43,6 +43,7 @@ class BaseBot:
 
     Subclasses may override inherited command methods or register another
     method for an inherited command name. Unmatched input goes to on_message.
+    Use request.external_system to call the HTTPS endpoint linked to this bot.
     """
 
     template_id = ""

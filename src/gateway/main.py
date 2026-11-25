@@ -5,6 +5,7 @@ import hmac
 import hashlib
 import secrets
 import time
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated, Literal
@@ -14,7 +15,7 @@ from fastapi import FastAPI, Depends, Header, HTTPException, Query, Request
 from fastapi import Path as PathParam
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi import Response
-from pydantic import AnyHttpUrl, BaseModel, Field, field_validator
+from pydantic import AnyHttpUrl, BaseModel, Field, SecretStr, field_validator
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 from pybotx import FastAPIBotAppConfig, setup_fastapi_bot
@@ -29,7 +30,7 @@ from .models import (
     Base, Bot, Chat, InternalBot, Job, Message, NotificationIntegration, NotificationRoute,
     NotificationToken, UserGrant,
 )
-from .integrations import EchoHandler, HttpHandler, HandlerRequest
+from .integrations import EchoHandler, ExternalAuthType, ExternalSystem, HttpHandler, HandlerRequest
 from .templates import get_template, template_catalog
 
 engine = create_async_engine(settings.database_url, pool_pre_ping=True)
@@ -184,6 +185,14 @@ async def dispatch_template_message(bot_record: InternalBot | Bot, request: Hand
     ):
         result = await resolve_handler(bot_record.default_handler).handle(request)
     else:
+        if isinstance(bot_record, InternalBot) and bot_record.external_system_id is not None:
+            async with Session() as session:
+                system = await session.get(NotificationIntegration, bot_record.external_system_id)
+                if system and system.outbound_url:
+                    request = replace(request, external_system=ExternalSystem(
+                        system.id, system.name, system.outbound_url,
+                        system.outbound_auth_type, system.outbound_token,
+                    ))
         result = await template_class().dispatch(request)
     if result.status != "completed" or result.error:
         raise RuntimeError(result.error or "bot template handler failed")
@@ -584,6 +593,7 @@ class InternalBotRequest(BaseModel):
     groups_enabled: bool = True
     group_history_enabled: bool = True
     botx_id: uuid.UUID | None = None
+    external_system_id: int | None = Field(default=None, ge=1, le=2_147_483_647)
 
 
 def internal_bot_info(record: InternalBot) -> dict:
@@ -591,6 +601,7 @@ def internal_bot_info(record: InternalBot) -> dict:
         "id": record.id, "name": record.name, "template_id": record.template_id,
         "botx_id": record.botx_id, "groups_enabled": record.groups_enabled,
         "group_history_enabled": record.group_history_enabled,
+        "external_system_id": record.external_system_id,
     }
 
 
@@ -616,6 +627,14 @@ async def validate_internal_bot_connection(session, botx_id: uuid.UUID | None, i
         raise HTTPException(409, "BotX already has an incoming handler")
 
 
+async def update_internal_bot_system(session, record: InternalBot, req: InternalBotRequest):
+    if "external_system_id" not in req.model_fields_set:
+        return
+    if req.external_system_id is not None and not await session.get(NotificationIntegration, req.external_system_id):
+        raise HTTPException(404, "Внешняя система не найдена.")
+    record.external_system_id = req.external_system_id
+
+
 @app.get(_INTERNAL_BOTS_URL, dependencies=[Depends(authorized)])
 async def list_internal_bots():
     async with Session() as session:
@@ -629,6 +648,7 @@ async def create_internal_bot(req: InternalBotRequest):
         await validate_internal_bot_connection(session, req.botx_id)
         record = InternalBot(botx_id=req.botx_id)
         update_internal_settings(record, req)
+        await update_internal_bot_system(session, record, req)
         session.add(record)
         await session.flush()
         return internal_bot_info(record)
@@ -644,6 +664,7 @@ async def update_internal_bot(internal_bot_id: uuid.UUID, req: InternalBotReques
         if not record:
             raise HTTPException(404, "Internal bot not found")
         update_internal_settings(record, req)
+        await update_internal_bot_system(session, record, req)
         if change_connection:
             record.botx_id = req.botx_id
         return internal_bot_info(record)
@@ -858,6 +879,22 @@ class NotificationIntegrationRequest(BaseModel):
     name: str = Field(min_length=1, max_length=200)
     description: str = Field(min_length=1, max_length=4000)
     routes: list[NotificationRouteInput] | None = Field(default=None, max_length=100)
+    outbound_url: AnyHttpUrl | None = None
+    outbound_auth_type: ExternalAuthType = "none"
+    outbound_token: SecretStr | None = None
+
+    @field_validator("outbound_url")
+    @classmethod
+    def validate_outbound_url(cls, value):
+        if value is not None and len(str(value)) > 2048:
+            raise ValueError("Длина адреса не должна превышать 2048 символов.")
+        if value is not None and (
+            value.scheme != "https" or value.port != 443
+            or value.username is not None or value.password is not None
+            or value.fragment is not None
+        ):
+            raise ValueError("Укажите HTTPS-адрес на порту 443 без учётных данных и фрагмента.")
+        return value
 
     @field_validator("name", "description", mode="before")
     @classmethod
@@ -896,6 +933,8 @@ async def list_notification_integrations():
             integration = result.setdefault(row.id, {
                 "id": row.id, "name": row.name, "description": row.description,
                 "created_at": row.created_at, "tokens": [], "routes": [],
+                "outbound_url": row.outbound_url, "outbound_auth_type": row.outbound_auth_type,
+                "outbound_token_set": bool(row.outbound_token),
             })
             if token:
                 integration["tokens"].append(notification_token_info(token))
@@ -947,10 +986,32 @@ async def replace_notification_routes(session, integration_id: int, inputs: list
             route.chat_ids = list(dict.fromkeys(str(chat_id) for chat_id in item.chat_ids))
 
 
+def update_outbound_settings(row: NotificationIntegration, req: NotificationIntegrationRequest):
+    if "outbound_url" in req.model_fields_set:
+        row.outbound_url = str(req.outbound_url) if req.outbound_url is not None else None
+    auth_type = req.outbound_auth_type if "outbound_auth_type" in req.model_fields_set else row.outbound_auth_type
+    token = row.outbound_token
+    if "outbound_token" in req.model_fields_set:
+        token = req.outbound_token.get_secret_value() if req.outbound_token is not None else None
+        if token is not None and (
+            not 1 <= len(token) <= 4096 or any(not 33 <= ord(char) <= 126 for char in token)
+        ):
+            raise HTTPException(422, "Токен должен содержать от 1 до 4096 печатных ASCII-символов без пробелов.")
+    if auth_type == "none":
+        if req.outbound_token is not None:
+            raise HTTPException(422, "Выберите тип авторизации для токена.")
+        token = None
+    elif token is None:
+        raise HTTPException(422, "Укажите токен для выбранного типа авторизации.")
+    row.outbound_auth_type = auth_type
+    row.outbound_token = token
+
+
 @app.post(_INTEGRATIONS_URL, dependencies=[Depends(authorized)], status_code=201)
 async def create_notification_integration(req: NotificationIntegrationRequest):
     async with Session.begin() as session:
-        row = NotificationIntegration(name=req.name, description=req.description)
+        row = NotificationIntegration(name=req.name, description=req.description, outbound_auth_type="none")
+        update_outbound_settings(row, req)
         session.add(row)
         await session.flush()
         if req.routes:
@@ -965,9 +1026,31 @@ async def update_notification_integration(integration_id: NotificationPathId, re
         if not row:
             raise HTTPException(404, "Integration not found")
         row.name, row.description = req.name, req.description
+        update_outbound_settings(row, req)
         if req.routes is not None:
             await replace_notification_routes(session, row.id, req.routes)
     return {"id": row.id}
+
+
+@app.post(_INTEGRATIONS_URL + "/{integration_id}/check", dependencies=[Depends(authorized)])
+async def check_external_system(integration_id: NotificationPathId):
+    async with Session() as session:
+        row = await session.get(NotificationIntegration, integration_id)
+        if row is None:
+            raise HTTPException(404, "Внешняя система не найдена.")
+        if not row.outbound_url:
+            raise HTTPException(409, "Укажите HTTPS-адрес внешней системы.")
+        host = httpx.URL(row.outbound_url).raw_host.decode("ascii").strip("[]")
+
+    try:
+        _, writer = await asyncio.wait_for(asyncio.open_connection(host, 443), timeout=5)
+        writer.close()
+        await writer.wait_closed()
+    except TimeoutError as exc:
+        raise HTTPException(504, "Истекло время ожидания подключения к TCP-порту 443.") from exc
+    except OSError as exc:
+        raise HTTPException(502, "Не удалось подключиться к TCP-порту 443.") from exc
+    return {"status": "ok", "port": 443}
 
 
 @app.put(_INTEGRATIONS_URL + "/{integration_id}/routes/{bot_id}", dependencies=[Depends(authorized)])

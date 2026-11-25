@@ -8,6 +8,10 @@
   let grants = [];
   const notice = document.getElementById('notice');
   const integrationsUrl = '/api/v1/admin/notification-integrations';
+  const outboundAuthLabels = {
+    none: 'Без авторизации', bearer: 'Bearer', api_key: 'API-ключ (X-API-Key)',
+    token: 'Authorization: Token', basic: 'Basic (Base64)',
+  };
   const createButton = document.getElementById('create-button');
   const helpDialog = document.getElementById('help-dialog');
   const helpContent = document.getElementById('help-content');
@@ -32,7 +36,7 @@
     integrations: {
       element: document.getElementById('integrations-section'),
       title: 'Внешние системы',
-      description: 'Маршруты отправки сообщений, токены и журнал доставки.',
+      description: 'Уведомления в BotX и запросы ботов к внешним API.',
     },
   };
   let bots = [];
@@ -119,6 +123,31 @@
     return empty;
   }
 
+  function connectionCheck(name, url, pending, success, configured = true) {
+    const button = integrationButton('Проверить связь');
+    button.setAttribute('aria-label', `Проверить связь с «${name}»`);
+    button.disabled = !configured;
+    if (!configured) button.title = 'Сначала сохраните HTTPS-адрес системы.';
+    const notice = integrationText('p', '', 'notice botx-check-result');
+    notice.setAttribute('role', 'status');
+    notice.hidden = true;
+    button.addEventListener('click', async () => {
+      button.disabled = true;
+      notice.hidden = false;
+      notice.classList.remove('error');
+      notice.textContent = pending;
+      try {
+        notice.textContent = success(await api(url, { method: 'POST' }));
+      } catch (error) {
+        notice.classList.add('error');
+        notice.textContent = error.message;
+      } finally {
+        button.disabled = false;
+      }
+    });
+    return { button, notice };
+  }
+
   function renderBots() {
     botsList.replaceChildren();
     document.getElementById('bot-count').textContent = String(bots.length);
@@ -131,26 +160,10 @@
       const handler = bot.internal_bot_id ? [{ name: bot.internal_bot_name, type: 'bot', edge: 'exchange' }] : [];
       const state = integrationText('span', bot.notification_ready ? 'Подключён' : 'Недоступен',
         `status-tag${bot.notification_ready ? '' : ' disabled'}`);
-      const check = integrationButton('Проверить');
-      check.setAttribute('aria-label', `Проверить подключение «${bot.name}»`);
-      const checkResult = integrationText('p', '', 'notice botx-check-result');
-      checkResult.setAttribute('role', 'status');
-      checkResult.hidden = true;
-      check.addEventListener('click', async () => {
-        check.disabled = true;
-        checkResult.hidden = false;
-        checkResult.classList.remove('error');
-        checkResult.textContent = 'Проверяем доступ к CTS…';
-        try {
-          const result = await api(`/api/v1/admin/botx/${bot.bot_id}/check`, { method: 'POST' });
-          checkResult.textContent = `CTS доступен. Доступных чатов: ${result.chat_count}.`;
-        } catch (error) {
-          checkResult.classList.add('error');
-          checkResult.textContent = error.message;
-        } finally {
-          check.disabled = false;
-        }
-      });
+      const { button: check, notice: checkResult } = connectionCheck(
+        bot.name, `/api/v1/admin/botx/${bot.bot_id}/check`, 'Проверяем доступ к CTS…',
+        result => `CTS доступен. Доступных чатов: ${result.chat_count}.`,
+      );
       row.append(
         recordHeading('botx', bot, check),
         recordBody([
@@ -181,6 +194,7 @@
     return {
       name: fields.get('name').trim(),
       botx_id: botxId === 'unlinked' ? null : botxId,
+      external_system_id: Number(fields.get('external_system_id')) || null,
       template_id: fields.get('template_id'),
       groups_enabled: fields.has('groups_enabled'),
       group_history_enabled: form.elements.group_history_enabled.checked,
@@ -201,6 +215,7 @@
     if (!internalBots.length) list.append(makeEmpty('Нет внутренних ботов', 'Создайте бота и выберите для него подключение BotX.'));
     for (const handler of internalBots) {
       const connection = bots.find(bot => bot.bot_id === handler.botx_id);
+      const system = integrations.find(item => item.id === handler.external_system_id);
       const card = document.createElement('article');
       card.className = 'template-card record-card';
       const template = templates.find(item => item.id === handler.template_id);
@@ -213,8 +228,10 @@
           ['Тип бота', template?.name || handler.template_id],
           ['Групповые чаты', handler.groups_enabled ? 'Включены' : 'Выключены'],
           ['История групп', handler.groups_enabled && handler.group_history_enabled ? 'Сохраняется' : 'Не сохраняется'],
+          ['Внешняя система', system?.name || 'Не выбрана'],
         ], { name: handler.name, type: 'bot' },
-        connection ? [{ name: connection.name, type: 'botx', edge: 'exchange' }] : []),
+        connection ? [{ name: connection.name, type: 'botx', edge: 'exchange' }] : [],
+        system ? [{ name: system.name, type: 'system', edge: 'request' }] : []),
       );
       if (template?.commands.length) {
         const commandList = document.createElement('ul');
@@ -330,7 +347,9 @@
   }
 
   const graphTypes = { botx: 'BotX', bot: 'Внутренний бот', system: 'Внешняя система' };
-  const graphRelations = { exchange: 'Входящие и ответы', send: 'Отправка из системы' };
+  const graphRelations = {
+    exchange: 'Входящие и ответы', send: 'Уведомления в BotX', request: 'Запросы бота к API',
+  };
 
   function svgElement(tag, attributes = {}) {
     const element = document.createElementNS('http://www.w3.org/2000/svg', tag);
@@ -509,21 +528,30 @@
       row.append(revoke);
       tokenList.append(row);
     }
-    const issue = integrationButton('Выпустить токен');
+    const issue = integrationButton('Выпустить токен уведомлений');
     issue.id = `issue-token-${integration.id}`;
     issue.setAttribute('aria-haspopup', 'dialog');
     issue.addEventListener('click', () => openTokenDialog(integration));
     if (!activeTokens.length) tokenList.append(integrationText('p', 'Нет действующих токенов.', 'muted'));
-    const credentials = recordDetails(`Токены системы · ${activeTokens.length}`, tokenList);
+    const credentials = recordDetails(`Токены уведомлений · ${activeTokens.length}`, tokenList, issue);
     credentials.id = `system-tokens-${integration.id}`;
     credentials.open = Boolean(document.getElementById(credentials.id)?.open);
     const connections = integration.routes.map(route => ({ name: route.bot_name, type: 'botx', edge: 'send' }));
+    const clients = internalBots.filter(bot => bot.external_system_id === integration.id);
+    const { button: check, notice: checkResult } = connectionCheck(
+      integration.name, `${integrationsUrl}/${integration.id}/check`, 'Проверяем TCP-подключение к порту 443…',
+      result => `TCP-порт ${result.port} доступен.`, Boolean(integration.outbound_url),
+    );
     card.append(
-      recordHeading('integrations', integration, issue),
+      recordHeading('integrations', integration, check),
       recordBody([
-        ['Получатели и назначение', integrationText('span', integration.description, 'record-description')],
-        ['Подключения BotX', String(connections.length)],
-      ], { name: integration.name, type: 'system' }, [], connections),
+        ['Назначение', integrationText('span', integration.description, 'record-description')],
+        ['Маршруты уведомлений BotX', String(connections.length)],
+        ['HTTPS-адрес API', integration.outbound_url || 'Не указан'],
+        ['Авторизация запросов бота', outboundAuthLabels[integration.outbound_auth_type]],
+      ], { name: integration.name, type: 'system' },
+      clients.map(bot => ({ name: bot.name, type: 'bot', edge: 'request' })), connections),
+      checkResult,
       credentials, deliveryLog(integration.id),
     );
     return card;
@@ -532,7 +560,7 @@
   function renderIntegrations() {
     integrationsList.replaceChildren(...integrations.map(renderIntegration));
     if (!integrations.length) {
-      integrationsList.append(makeEmpty('Нет внешних систем', 'Добавьте систему, настройте маршруты и выпустите токен.'));
+      integrationsList.append(makeEmpty('Нет внешних систем', 'Добавьте систему для уведомлений или запросов бота.'));
     }
   }
 
@@ -643,6 +671,10 @@
         if (record) connection.add(new Option('Без подключения', 'unlinked'));
         for (const bot of available) connection.add(new Option(bot.name, bot.bot_id));
         connection.value = record ? record.botx_id || 'unlinked' : '';
+        const system = form.elements.external_system_id;
+        system.replaceChildren(new Option('Без внешней системы', ''));
+        for (const item of integrations) system.add(new Option(item.name, item.id));
+        system.value = record?.external_system_id || '';
         form.elements.groups_enabled.checked = record?.groups_enabled ?? true;
         form.elements.group_history_enabled.checked = record?.group_history_enabled ?? true;
         setGroupHistoryState(form);
@@ -653,12 +685,18 @@
       id: record => record.id,
       title: 'Новая внешняя система',
       submit: 'Добавить систему',
-      message: 'Система добавлена. Теперь можно выпустить токен.',
+      message: 'Система добавлена.',
       read: readIntegrationSettings,
       fill(form, record) {
         form.elements.description.value = record?.description || '';
+        form.elements.outbound_url.value = record?.outbound_url || '';
+        form.elements.outbound_auth_type.value = record?.outbound_auth_type || 'none';
+        const token = form.elements.outbound_token;
+        token.dataset.saved = record?.outbound_token_set ? 'yes' : 'no';
+        token.placeholder = record?.outbound_token_set ? 'Оставьте пустым, чтобы сохранить токен' : '';
+        setOutboundAuthState(form);
         integrationRoutes.replaceChildren();
-        for (const route of record ? record.routes : [null]) addRouteFields(route);
+        for (const route of record?.routes || []) addRouteFields(route);
         updateAddRouteButton();
       },
     },
@@ -788,7 +826,8 @@
       form.elements.name.value = record?.name || '';
       config.fill(form, record);
       dialog.querySelector('h2').textContent = record ? 'Редактирование · ' + record.name : config.title;
-      dialog.querySelector('.panel-heading p').hidden = Boolean(record);
+      const description = dialog.querySelector('.panel-heading p');
+      if (description) description.hidden = Boolean(record);
       form.querySelector('button[type="submit"]').textContent = record ? 'Сохранить' : config.submit;
       dialog.showModal();
       form.elements.name.focus();
@@ -797,6 +836,9 @@
 
   const internalForm = document.getElementById('internal-bot-form');
   internalForm.elements.groups_enabled.addEventListener('change', () => setGroupHistoryState(internalForm));
+  const integrationForm = document.getElementById('integration-form');
+  integrationForm.elements.outbound_auth_type.addEventListener('change', () => setOutboundAuthState(integrationForm));
+  dialogs.integrations.addEventListener('close', () => { integrationForm.elements.outbound_token.value = ''; });
   for (const section of Object.keys(dialogs)) recordEditors[section] = bindRecordDialog(section);
   createButton.addEventListener('click', () => recordEditors[activeSection]());
   document.querySelectorAll('[data-help-section]').forEach(button => {
@@ -837,7 +879,15 @@
 
   addRouteButton.addEventListener('click', () => addRouteFields().focus());
 
-  function readIntegrationSettings(form, record) {
+  function setOutboundAuthState(form) {
+    const token = form.elements.outbound_token;
+    const needsToken = form.elements.outbound_auth_type.value !== 'none';
+    token.disabled = !needsToken;
+    token.required = needsToken && token.dataset.saved !== 'yes';
+    document.getElementById('integration-outbound-token-field').hidden = !needsToken;
+  }
+
+  function readIntegrationSettings(form) {
     const routes = [];
     const botIds = new Set();
     for (const row of integrationRoutes.children) {
@@ -846,8 +896,16 @@
       botIds.add(botId);
       routes.push({ bot_id: botId });
     }
-    if (!record && !routes.length) throw new Error('Добавьте хотя бы один маршрут через BotX.');
-    return { ...Object.fromEntries(new FormData(form)), routes };
+    const fields = new FormData(form);
+    const data = {
+      name: fields.get('name'),
+      description: fields.get('description'),
+      outbound_url: fields.get('outbound_url').trim() || null,
+      outbound_auth_type: fields.get('outbound_auth_type'),
+      routes,
+    };
+    if (fields.get('outbound_token')) data.outbound_token = fields.get('outbound_token');
+    return data;
   }
 
   const tokenDialog = document.getElementById('token-dialog');

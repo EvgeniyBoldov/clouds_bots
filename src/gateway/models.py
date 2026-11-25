@@ -29,6 +29,7 @@ class InternalBot(Base):
     template_id: Mapped[str] = mapped_column(String(64), default="echo")
     default_handler: Mapped[str] = mapped_column(String(100), default="echo")
     botx_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("bots.id"), unique=True)
+    external_system_id: Mapped[int | None] = mapped_column(ForeignKey("notification_integrations.id"))
     groups_enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
     group_history_enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
 
@@ -88,6 +89,9 @@ class NotificationIntegration(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(200))
     description: Mapped[str] = mapped_column(Text)
+    outbound_url: Mapped[str | None] = mapped_column(String(2048))
+    outbound_auth_type: Mapped[str] = mapped_column(String(16), default="none", server_default="none")
+    outbound_token: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 

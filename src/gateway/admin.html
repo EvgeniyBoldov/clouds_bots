@@ -81,7 +81,7 @@
             <section id="integrations-section" class="section-stack" hidden aria-labelledby="integrations-heading">
               <section class="panel">
                 <div class="panel-heading">
-                  <div><h2 id="integrations-heading">Внешние системы</h2><p>Отправляйте сообщения через <code>POST /api/v1/messages</code> с полями <code>bot_id</code>, <code>chat_id</code> и <code>text</code>.</p></div>
+                  <div><h2 id="integrations-heading">Внешние системы</h2><p>Настройте уведомления в BotX и запросы внутренних ботов к внешним API.</p></div>
                   <button type="button" class="button button-quiet help-icon" data-help-section="integrations" aria-label="Справка по внешним системам" aria-haspopup="dialog" title="Справка">?</button>
                 </div>
                 <div id="integrations-list" class="data-list" aria-live="polite"></div>
@@ -131,6 +131,10 @@
             <label class="field-label" for="internal-botx">Подключение BotX</label>
             <select id="internal-botx" name="botx_id" required></select>
           </div>
+          <div class="form-field form-field-wide">
+            <label class="field-label" for="internal-external-system">Внешняя система для запросов бота</label>
+            <select id="internal-external-system" name="external_system_id"></select>
+          </div>
           <div class="check-fields form-field-wide">
             <label><input type="checkbox" name="groups_enabled" checked> Обрабатывать групповые чаты</label>
             <label><input type="checkbox" name="group_history_enabled" checked> Сохранять историю групп</label>
@@ -143,20 +147,41 @@
         </form>
       </dialog>
       <dialog id="create-integration" class="panel create-dialog" aria-labelledby="create-integration-heading">
-        <div class="panel-heading"><div><h2 id="create-integration-heading">Новая внешняя система</h2><p>Укажите, какая система отправляет уведомления, кому и зачем они нужны.</p></div></div>
+        <div class="panel-heading"><div><h2 id="create-integration-heading">Новая внешняя система</h2></div></div>
         <form id="integration-form" class="bot-form">
           <div class="form-field">
             <label class="field-label" for="integration-name">Система</label>
             <input autofocus id="integration-name" name="name" maxlength="200" required>
           </div>
           <div class="form-field form-field-wide">
-            <label class="field-label" for="integration-description">Получатели и назначение</label>
-            <textarea id="integration-description" name="description" rows="3" maxlength="4000" placeholder="Например, команда эксплуатации получает сообщения о сбоях мониторинга" required></textarea>
+            <label class="field-label" for="integration-description">Назначение</label>
+            <textarea id="integration-description" name="description" rows="3" maxlength="4000" required></textarea>
           </div>
           <fieldset class="route-settings form-field-wide">
-            <legend>Маршруты отправки</legend>
+            <legend>Уведомления в BotX</legend>
             <div id="integration-routes" class="data-list"></div>
             <button class="button button-quiet" type="button" id="add-integration-route">Добавить BotX</button>
+          </fieldset>
+          <fieldset class="route-settings form-field-wide">
+            <legend>Запросы бота к внешней системе</legend>
+            <div class="form-field">
+              <label class="field-label" for="integration-outbound-url">HTTPS-адрес API</label>
+              <input id="integration-outbound-url" name="outbound_url" type="url" maxlength="2048" placeholder="https://api.example.org/v1/requests">
+            </div>
+            <div class="form-field">
+              <label class="field-label" for="integration-outbound-auth">Тип авторизации</label>
+              <select id="integration-outbound-auth" name="outbound_auth_type">
+                <option value="none">Без авторизации</option>
+                <option value="bearer">Bearer</option>
+                <option value="api_key">API-ключ (X-API-Key)</option>
+                <option value="token">Authorization: Token</option>
+                <option value="basic">Basic (Base64)</option>
+              </select>
+            </div>
+            <div class="form-field" id="integration-outbound-token-field" hidden>
+              <label class="field-label" for="integration-outbound-token">Токен внешней системы</label>
+              <input id="integration-outbound-token" name="outbound_token" type="password" maxlength="4096" autocomplete="new-password">
+            </div>
           </fieldset>
           <p class="create-error" role="alert" hidden></p>
           <div class="form-actions modal-actions">
@@ -194,7 +219,7 @@
       <dialog id="token-dialog" class="panel create-dialog" aria-labelledby="token-dialog-heading">
         <div class="panel-heading">
           <div>
-            <h2 id="token-dialog-heading">Выпустить токен</h2>
+            <h2 id="token-dialog-heading">Выпустить токен уведомлений</h2>
             <p id="token-system-name"></p>
           </div>
         </div>
@@ -253,6 +278,11 @@
       </template>
 
       <template id="help-integrations">
+        <section>
+          <h3>Запросить внешнее API из бота</h3>
+          <p>Сохраните HTTPS-адрес и настройки авторизации в карточке системы. Выберите эту систему в настройках внутреннего бота. Шаблон бота определяет, когда отправлять запрос и как обработать ответ.</p>
+          <p>Кнопка «Проверить связь» проверяет TCP-подключение шлюза к порту 443 сохранённого адреса.</p>
+        </section>
         <section>
           <h3>Отправить уведомление</h3>
           <p>Выпустите токен для системы. Используйте адрес шлюза, доступный отправителю, UUID BotX из маршрута и UUID чата, в который бот может писать.</p>
