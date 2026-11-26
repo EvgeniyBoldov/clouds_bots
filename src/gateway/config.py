@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     bot_accounts_json: str = "[]"
     worker_poll_seconds: float = 1.0
     handler_configs_json: str = "{}"
+    log_level: str = "INFO"
 
 
 settings = Settings()

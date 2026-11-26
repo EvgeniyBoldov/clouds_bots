@@ -3,6 +3,7 @@ import uuid
 import asyncio
 import hmac
 import hashlib
+import logging
 import secrets
 import time
 from dataclasses import replace
@@ -15,17 +16,14 @@ from fastapi import FastAPI, Depends, Header, HTTPException, Query, Request
 from fastapi import Path as PathParam
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi import Response
-from pydantic import AnyHttpUrl, BaseModel, Field, SecretStr, field_validator
+from pydantic import AnyHttpUrl, BaseModel, Field, SecretStr, field_validator, model_validator
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
-from pybotx import FastAPIBotAppConfig, setup_fastapi_bot
 from pybotx import (
-    BotAccountKey, BotAccountWithSecret, InvalidBotAccountError, PermissionDeniedError,
-    RateLimitReachedError, UnknownBotAccountError, UserNotFoundError,
+    BotAccountKey, BotAccountWithSecret, FastAPIBotAppConfig, setup_fastapi_bot,
 )
-from pybotx.client.exceptions.base import BaseClientError
-from pybotx.client.exceptions.http import InvalidBotXStatusCodeError
 
+from .botx_client import BotXClient, BotXClientError, BotXConnectionError, BotXHTTPError
 from .config import settings
 from .models import (
     Base, Bot, Chat, InternalBot, Job, Message, NotificationIntegration, NotificationRoute,
@@ -33,6 +31,15 @@ from .models import (
 )
 from .integrations import EchoHandler, ExternalAuthType, ExternalSystem, HttpHandler, HandlerRequest
 from .templates import get_template, template_catalog
+
+_level = getattr(logging, str(settings.log_level).upper(), logging.INFO)
+if not isinstance(_level, int):
+    _level = logging.INFO
+logging.basicConfig(
+    level=_level,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logger = logging.getLogger("gateway")
 
 engine = create_async_engine(settings.database_url, pool_pre_ping=True)
 Session = async_sessionmaker(engine, expire_on_commit=False)
@@ -245,8 +252,17 @@ async def recover_jobs_and_work(bot_client):
     await process_jobs(bot_client)
 
 
+async def deliver_notification(
+    bot_id: uuid.UUID, chat_id: uuid.UUID, text: str, cts_url: str, secret_key: str
+) -> None:
+    """Send a notification straight to CTS through the gateway's own BotX client."""
+    async with BotXClient(bot_id=bot_id, cts_url=cts_url, secret_key=secret_key) as client:
+        await client.send_notification(chat_id, text)
+
+
 async def process_jobs(bot_client):
     while True:
+        cts_url = secret_key = None
         async with Session() as session:
             async with session.begin():
                 job = await session.scalar(select(Job).where(Job.status == "pending").order_by(Job.id).with_for_update(skip_locked=True).limit(1))
@@ -255,6 +271,10 @@ async def process_jobs(bot_client):
                     job.attempts += 1
                     job_id, bot_id, chat_id, payload = job.id, job.bot_id, job.chat_id, job.payload
                     attempts = job.attempts
+                    if payload.get("kind") == "notification":
+                        bot_record = await session.get(Bot, bot_id)
+                        if bot_record:
+                            cts_url, secret_key = bot_record.cts_url, bot_record.secret_key
             if job is None:
                 await asyncio.sleep(settings.worker_poll_seconds)
                 continue
@@ -281,16 +301,29 @@ async def process_jobs(bot_client):
                 else:
                     output = payload["text"]
                 if output:
-                    await asyncio.wait_for(
-                        bot_client.send_message(bot_id=bot_id, chat_id=chat_id, body=output),
-                        timeout=20,
-                    )
+                    if payload.get("kind") == "notification":
+                        await asyncio.wait_for(
+                            deliver_notification(bot_id, chat_id, output, cts_url, secret_key),
+                            timeout=30,
+                        )
+                    else:
+                        await asyncio.wait_for(
+                            bot_client.send_message(bot_id=bot_id, chat_id=chat_id, body=output),
+                            timeout=20,
+                        )
             except Exception as exc:
                 status = "pending" if attempts < 3 else "failed"
                 delivery_error = "timeout" if isinstance(exc, TimeoutError) else "send_failed"
+                logger.warning(
+                    "Job %s delivery failed (attempt %d): %r", job_id, attempts, exc
+                )
             else:
                 status = "completed"
                 delivery_error = None
+                logger.info("Job %s delivered to chat %s", job_id, chat_id)
+
+            if status == "failed":
+                logger.error("Job %s failed permanently after %d attempts", job_id, attempts)
 
             async with session.begin():
                 record = await session.get(Job, job_id)
@@ -448,22 +481,26 @@ async def check_botx(bot_id: uuid.UUID):
             raise HTTPException(404, "Подключение BotX не найдено.")
         if not record.enabled or not record.cts_url or not record.secret_key:
             raise HTTPException(409, "Подключение отключено или не настроено.")
+        cts_url, secret_key = record.cts_url, record.secret_key
 
     try:
-        chats = await asyncio.wait_for(bot.list_chats(bot_id=bot_id), timeout=10)
-    except (TimeoutError, httpx.TimeoutException) as exc:
+        async with BotXClient(
+            bot_id=bot_id, cts_url=cts_url, secret_key=secret_key
+        ) as client:
+            chats = await client.list_chats()
+    except TimeoutError as exc:
         raise HTTPException(504, "CTS не ответил за время проверки.") from exc
-    except httpx.RequestError as exc:
+    except BotXConnectionError as exc:
         raise HTTPException(502, "Не удалось связаться с CTS. Проверьте адрес и сетевой доступ.") from exc
-    except InvalidBotAccountError as exc:
-        raise HTTPException(502, "Не удалось авторизовать бота в CTS. Сверьте его учётные данные.") from exc
-    except PermissionDeniedError as exc:
-        raise HTTPException(502, "CTS запретил боту запрашивать список чатов.") from exc
-    except RateLimitReachedError as exc:
-        raise HTTPException(503, "CTS ограничил частоту запросов. Повторите проверку позже.") from exc
-    except UnknownBotAccountError as exc:
-        raise HTTPException(409, "Учётная запись ещё не загружена шлюзом.") from exc
-    except BaseClientError as exc:
+    except BotXHTTPError as exc:
+        if exc.status_code == 401:
+            raise HTTPException(502, "Не удалось авторизовать бота в CTS. Сверьте его учётные данные.") from exc
+        if exc.status_code == 403:
+            raise HTTPException(502, "CTS запретил боту запрашивать список чатов.") from exc
+        if exc.status_code == 429:
+            raise HTTPException(503, "CTS ограничил частоту запросов. Повторите проверку позже.") from exc
+        raise HTTPException(502, "CTS вернул ошибку при запросе списка чатов.") from exc
+    except BotXClientError as exc:
         raise HTTPException(502, "CTS вернул ошибку при запросе списка чатов.") from exc
     return {"status": "ok", "chat_count": len(chats)}
 
@@ -782,19 +819,25 @@ def grant_response(grant: UserGrant) -> dict:
     }
 
 
-async def resolve_botx_user_by_email(bot_id: uuid.UUID, email: str):
+async def resolve_botx_user_by_email(bot_record: Bot, email: str) -> dict | None:
+    async with BotXClient(
+        bot_id=bot_record.id, cts_url=bot_record.cts_url, secret_key=bot_record.secret_key
+    ) as client:
+        return await client.find_user_by_email(email)
+
+
+async def resolve_botx_user_by_ad(bot_record: Bot, ad_login: str, ad_domain: str) -> dict | None:
+    async with BotXClient(
+        bot_id=bot_record.id, cts_url=bot_record.cts_url, secret_key=bot_record.secret_key
+    ) as client:
+        return await client.find_user_by_ad(ad_login, ad_domain)
+
+
+def botx_user_huid(record: dict) -> uuid.UUID:
     try:
-        return await bot.search_user_by_email_post(bot_id=bot_id, email=email)
-    except (UserNotFoundError, InvalidBotXStatusCodeError) as post_error:
-        # Older CTS deployments can return 404 or 405 for the POST route.
-        if isinstance(post_error, InvalidBotXStatusCodeError) and post_error.response.status_code not in {405, 501}:
-            raise
-        try:
-            return await bot.search_user_by_email(bot_id=bot_id, email=email)
-        except InvalidBotXStatusCodeError as get_error:
-            if isinstance(post_error, UserNotFoundError) and get_error.response.status_code in {405, 501}:
-                raise post_error from get_error
-            raise
+        return uuid.UUID(str(record["user_huid"]))
+    except (KeyError, ValueError, TypeError) as exc:
+        raise HTTPException(502, "eXpress returned a malformed user record") from exc
 
 
 @app.post("/api/v1/admin/grants", dependencies=[Depends(authorized)])
@@ -831,23 +874,18 @@ async def create_grant(req: GrantRequest):
                 if req.identity_type == "email":
                     if "@" not in identity or any(char.isspace() for char in identity):
                         raise HTTPException(422, "Email address is invalid")
-                    resolved_user = await resolve_botx_user_by_email(
-                        bot_id=bot_record.id,
-                        email=identity,
-                    )
+                    resolved_user = await resolve_botx_user_by_email(bot_record, identity)
                 else:
-                    resolved_user = await bot.search_user_by_ad(
-                        bot_id=bot_record.id,
-                        ad_login=identity,
-                        ad_domain=req.ad_domain.strip(),
+                    resolved_user = await resolve_botx_user_by_ad(
+                        bot_record, identity, req.ad_domain.strip()
                     )
-            except UserNotFoundError as exc:
-                raise HTTPException(404, "User not found on this eXpress server") from exc
             except HTTPException:
                 raise
             except Exception as exc:
                 raise HTTPException(502, "Could not resolve user through BotX") from exc
-            resolved_huid = str(resolved_user.huid)
+            if resolved_user is None:
+                raise HTTPException(404, "User not found on this eXpress server")
+            resolved_huid = str(botx_user_huid(resolved_user))
             identity_value = identity
 
         existing = await s.scalar(select(UserGrant).where(
@@ -1198,7 +1236,9 @@ async def authorized_notification(
 
 class Notification(BaseModel):
     bot_id: uuid.UUID
-    chat_id: uuid.UUID
+    chat_id: uuid.UUID | None = None
+    user_huid: uuid.UUID | None = None
+    email: str | None = None
     text: str
 
     @field_validator("text")
@@ -1208,32 +1248,112 @@ class Notification(BaseModel):
             raise ValueError("Notification text must be non-blank and contain no null characters")
         return value
 
+    @model_validator(mode="after")
+    def validate_recipient(self) -> "Notification":
+        targets = [
+            target for target in (self.chat_id, self.user_huid, self.email) if target is not None
+        ]
+        if len(targets) != 1:
+            raise ValueError("Specify exactly one of chat_id, user_huid or email")
+        if self.email is not None and (
+            "@" not in self.email or any(char.isspace() for char in self.email)
+        ):
+            raise ValueError("Email address is invalid")
+        return self
 
-async def allows_notification(session, token: NotificationToken, bot_id: uuid.UUID, chat_id: uuid.UUID):
+
+async def allows_notification(
+    session,
+    token: NotificationToken,
+    bot_id: uuid.UUID,
+    chat_id: uuid.UUID | None,
+    *,
+    user_targeted: bool = False,
+):
     if token.bot_id is not None and token.bot_id != bot_id:
         return False
     route = await session.get(NotificationRoute, (token.integration_id, bot_id))
-    return bool(route and (not route.chat_ids or str(chat_id) in route.chat_ids))
+    if not route:
+        return False
+    if user_targeted:
+        # Fail closed: a user-targeted delivery may land in any personal chat,
+        # so it is only allowed when the route has no chat allowlist.
+        return not route.chat_ids
+    return not route.chat_ids or str(chat_id) in route.chat_ids
+
+
+async def personal_chat_for_user(session, bot_record: Bot, user_huid: uuid.UUID) -> uuid.UUID:
+    """Reuse the bot's personal chat with this user, or create it on CTS."""
+    for chat in await session.scalars(
+        select(Chat).where(Chat.bot_id == bot_record.id, Chat.chat_type == "personal")
+    ):
+        if (chat.settings or {}).get("user_huid") == str(user_huid):
+            return chat.chat_id
+    async with BotXClient(
+        bot_id=bot_record.id, cts_url=bot_record.cts_url, secret_key=bot_record.secret_key
+    ) as client:
+        try:
+            chat_id = await client.create_chat("Personal chat", "chat", [user_huid])
+        except BotXClientError as exc:
+            raise HTTPException(502, "Could not create a personal chat with this user on CTS") from exc
+    session.add(Chat(
+        bot_id=bot_record.id,
+        chat_id=chat_id,
+        chat_type="personal",
+        history_enabled=False,
+        settings={"user_huid": str(user_huid)},
+    ))
+    return chat_id
 
 
 @app.post("/api/v1/messages", status_code=202)
 @app.post("/api/v1/notifications", status_code=202)
 async def notification(req: Notification, token: NotificationToken | None = Depends(authorized_notification)):
     async with Session.begin() as session:
-        if token and not await allows_notification(session, token, req.bot_id, req.chat_id):
+        user_targeted = req.email is not None or req.user_huid is not None
+        if token and not await allows_notification(
+            session, token, req.bot_id,
+            None if user_targeted else req.chat_id,
+            user_targeted=user_targeted,
+        ):
             raise HTTPException(403, "System is not authorized to send to this BotX and chat")
         record = await session.get(Bot, req.bot_id)
         if not record or not record.enabled or not record.cts_url or not record.secret_key:
             raise HTTPException(404, "Bot not found or not connected")
+        recipient_huid = req.user_huid
+        if req.email is not None:
+            try:
+                resolved = await resolve_botx_user_by_email(record, req.email)
+            except BotXClientError as exc:
+                raise HTTPException(502, "Could not resolve user through BotX") from exc
+            if resolved is None:
+                raise HTTPException(404, "User not found on this eXpress server")
+            recipient_huid = botx_user_huid(resolved)
+        if recipient_huid is not None:
+            target_chat_id = await personal_chat_for_user(session, record, recipient_huid)
+        else:
+            target_chat_id = req.chat_id
+        payload = {"text": req.text, "kind": "notification"}
+        if recipient_huid is not None:
+            payload["user_huid"] = str(recipient_huid)
         job = Job(
             bot_id=req.bot_id,
-            chat_id=req.chat_id,
-            payload={"text": req.text, "kind": "notification"},
+            chat_id=target_chat_id,
+            payload=payload,
             notification_token_id=token.id if token else None,
         )
         session.add(job)
         await session.flush()
-    return {"job_id": job.id, "status": job.status}
+        logger.info(
+            "Notification job %s accepted for bot %s chat %s%s",
+            job.id, req.bot_id, target_chat_id,
+            f" (user {recipient_huid})" if recipient_huid is not None else "",
+        )
+    response = {"job_id": job.id, "status": job.status}
+    if recipient_huid is not None:
+        response["user_huid"] = str(recipient_huid)
+        response["chat_id"] = str(target_chat_id)
+    return response
 
 
 @app.get("/api/v1/messages/{job_id}")
@@ -1250,7 +1370,10 @@ async def notification_status(
             owner = await session.get(NotificationToken, job.notification_token_id) if job.notification_token_id else None
             if (
                 not owner or owner.integration_id != token.integration_id
-                or not await allows_notification(session, token, job.bot_id, job.chat_id)
+                or not await allows_notification(
+                    session, token, job.bot_id, job.chat_id,
+                    user_targeted=job.payload.get("user_huid") is not None,
+                )
             ):
                 raise HTTPException(404, "Notification not found")
         return {"job_id": job.id, "status": job.status, "attempts": job.attempts}

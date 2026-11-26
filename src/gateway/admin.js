@@ -724,12 +724,14 @@
 
       function updateExample() {
         const data = { bot_id: select.value || 'BOTX_UUID', chat_id: 'CHAT_UUID', text: 'Проверка доставки' };
-        example.textContent = [
+        const command = [
           'curl -sS -X POST "$GATEWAY_URL/api/v1/messages"',
           '  -H "X-Notification-Token: $INTEGRATION_TOKEN"',
           '  -H "Content-Type: application/json"',
           `  --data '${JSON.stringify(data)}'`,
         ].join(' \\' + '\n');
+        const note = '# получатель — chat_id, user_huid или email; для юзера личный чат создаётся автоматически';
+        example.textContent = note + '\n' + command;
       }
 
       function updateRoutes() {

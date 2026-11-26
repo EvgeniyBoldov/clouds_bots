@@ -17,7 +17,7 @@ Open `/` for the admin page and sign in with `GATEWAY_ADMIN_TOKEN`. The admin pa
 
 `src/gateway/bot.py` uses pybotx's `BotAccountProvider` snapshot so newly registered credentials apply without restarting the process. It persists authorized personal messages, deduplicates events, answers personal chats, and routes group messages to the selected template, with default replies for structured contact mentions, replies to the bot, and slash commands. Group calls are open to all users. Use `allowed_data=all` in eXpress admin.
 
-The main app mounts the documented pybotx routes and runs a PostgreSQL polling worker that sends queued notification messages via `Bot.send_message`. `gateway.bot` supplies the shared collector and Bot instance.
+The main app mounts the documented pybotx routes and runs a PostgreSQL polling worker that sends queued notification messages through the gateway's own BotX client (`src/gateway/botx_client.py`); message and summary replies still go through pybotx's `Bot.send_message`. `gateway.bot` supplies the shared collector and Bot instance.
 
 ## Send messages and notifications
 
@@ -32,7 +32,16 @@ curl -X POST "$GATEWAY_URL/api/v1/messages" \
   -d '{"bot_id":"123e4567-e89b-12d3-a456-426655440000","chat_id":"123e4567-e89b-12d3-a456-426655440001","text":"Deployment complete"}'
 ```
 
-Use the UUID of a connected bot and the UUID of a chat the bot can send to. The gateway returns `202 Accepted` with `{"job_id":123,"status":"pending"}` after saving the job. The worker sends the message through BotX using the registered bot's credentials.
+Use the UUID of a connected bot and the UUID of a chat the bot can send to. To notify a person instead of a chat, send exactly one of `chat_id`, `user_huid` or `email`. For `email` the gateway resolves the user on that bot's CTS; for a user it reuses the bot's existing personal chat with them or creates one on CTS, then delivers the notification there. The `202` response for a user-targeted notification also includes the resolved `user_huid` and the `chat_id` used:
+
+```sh
+curl -X POST "$GATEWAY_URL/api/v1/messages" \
+  -H "X-Notification-Token: $INTEGRATION_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"bot_id":"123e4567-e89b-12d3-a456-426655440000","email":"user@example.org","text":"Deployment complete"}'
+```
+
+Routes with a chat allowlist keep applying to `chat_id` sends; user-targeted sends are only allowed for routes without a chat allowlist, so the system can reach the user wherever the personal chat lands. The gateway returns `202 Accepted` with `{"job_id":123,"status":"pending"}` after saving the job. The worker sends the message through BotX using the registered bot's credentials.
 
 Use `GET /api/v1/messages/123` with the same token to read the current `status` and number of `attempts`. `completed` means BotX confirmed the send. `failed` means all three attempts failed. The existing `/api/v1/notifications` URLs still work. Each POST creates a new job. If BotX accepts a message but its confirmation times out, a worker retry can send it again.
 
