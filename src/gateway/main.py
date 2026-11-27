@@ -17,13 +17,14 @@ from fastapi import Path as PathParam
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi import Response
 from pydantic import AnyHttpUrl, BaseModel, Field, SecretStr, field_validator, model_validator
-from sqlalchemy import select, text
+from sqlalchemy import or_, select, text, update
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 from pybotx import (
     BotAccountKey, BotAccountWithSecret, FastAPIBotAppConfig, setup_fastapi_bot,
 )
 
 from .botx_client import BotXClient, BotXClientError, BotXConnectionError, BotXHTTPError
+from .chats import personal_chat_for_user, reconcile_bot_chats_periodically
 from .config import settings
 from .models import (
     Base, Bot, Chat, InternalBot, Job, Message, NotificationIntegration, NotificationRoute,
@@ -31,6 +32,7 @@ from .models import (
 )
 from .integrations import EchoHandler, ExternalAuthType, ExternalSystem, HttpHandler, HandlerRequest
 from .templates import get_template, template_catalog
+from . import kopatych  # Register the built-in template.
 
 _level = getattr(logging, str(settings.log_level).upper(), logging.INFO)
 if not isinstance(_level, int):
@@ -174,7 +176,7 @@ async def dispatch_template_message(bot_record: InternalBot | Bot, request: Hand
 
     template_class = registration.bot_class
     command_name = request.command.lower() if request.command else None
-    if command_name == "/summary" and not template_class.has_command("/summary"):
+    if registration.id != "kopatych" and command_name == "/summary" and not template_class.has_command("/summary"):
         if isinstance(bot_record, InternalBot) and not bot_record.group_history_enabled:
             return "Хранение истории групп для этого бота выключено."
         payload = {
@@ -226,7 +228,10 @@ async def dispatch_queued_message(
         command=command_name,
         metadata={"is_mentioned": payload.get("is_mentioned", False),
                   "is_reply_to_bot": payload.get("is_reply_to_bot", False),
-                  "reply": payload.get("reply")},
+                  "reply": payload.get("reply"),
+                  "sender_ad_login": payload.get("sender_ad_login"),
+                  "sender_ad_domain": payload.get("sender_ad_domain")},
+        internal_bot_id=str(bot_record.id),
     )
     return await dispatch_template_message(bot_record, request)
 
@@ -249,7 +254,10 @@ async def job_worker(bot_client):
 async def recover_jobs_and_work(bot_client):
     async with Session.begin() as session:
         await session.execute(text("UPDATE jobs SET status='pending' WHERE status='processing'"))
-    await process_jobs(bot_client)
+    async with asyncio.TaskGroup() as workers:
+        workers.create_task(process_jobs(bot_client))
+        workers.create_task(kopatych.poll_portal_runs(Session, bot_client))
+        workers.create_task(reconcile_bot_chats_periodically(Session))
 
 
 async def deliver_notification(
@@ -262,7 +270,6 @@ async def deliver_notification(
 
 async def process_jobs(bot_client):
     while True:
-        cts_url = secret_key = None
         async with Session() as session:
             async with session.begin():
                 job = await session.scalar(select(Job).where(Job.status == "pending").order_by(Job.id).with_for_update(skip_locked=True).limit(1))
@@ -271,16 +278,19 @@ async def process_jobs(bot_client):
                     job.attempts += 1
                     job_id, bot_id, chat_id, payload = job.id, job.bot_id, job.chat_id, job.payload
                     attempts = job.attempts
-                    if payload.get("kind") == "notification":
-                        bot_record = await session.get(Bot, bot_id)
-                        if bot_record:
-                            cts_url, secret_key = bot_record.cts_url, bot_record.secret_key
             if job is None:
                 await asyncio.sleep(settings.worker_poll_seconds)
                 continue
 
+            delivered_message_id = None
+            kind = payload.get("kind")
+            user_huid = payload.get("user_huid") if kind == "notification" else None
+            reply_to_log = None
             try:
-                if payload.get("kind") in {"summary", "message"}:
+                if kind == "assignment_event":
+                    delivered_message_id = await kopatych.deliver_assignment_event(Session, bot_client, payload)
+                    output = ""
+                elif kind in {"summary", "message"}:
                     async with session.begin():
                         internal_bot = await session.scalar(
                             select(InternalBot).where(InternalBot.botx_id == bot_id)
@@ -301,19 +311,29 @@ async def process_jobs(bot_client):
                 else:
                     output = payload["text"]
                 if output:
-                    if payload.get("kind") == "notification":
+                    if kind == "notification":
+                        async with session.begin():
+                            bot_record = await session.get(Bot, bot_id)
+                            if not bot_record or not bot_record.enabled or not bot_record.cts_url or not bot_record.secret_key:
+                                raise ValueError("Notification BotX is unavailable")
+                            if user_huid:
+                                chat_id = await personal_chat_for_user(session, bot_record, uuid.UUID(user_huid))
+                                job.chat_id = chat_id
                         await asyncio.wait_for(
-                            deliver_notification(bot_id, chat_id, output, cts_url, secret_key),
+                            deliver_notification(bot_id, chat_id, output, bot_record.cts_url, bot_record.secret_key),
                             timeout=30,
                         )
                     else:
-                        await asyncio.wait_for(
+                        reply_to_log = output
+                        reply_id = await asyncio.wait_for(
                             bot_client.send_message(bot_id=bot_id, chat_id=chat_id, body=output),
                             timeout=20,
                         )
             except Exception as exc:
                 status = "pending" if attempts < 3 else "failed"
                 delivery_error = "timeout" if isinstance(exc, TimeoutError) else "send_failed"
+                if user_huid and isinstance(exc, BotXHTTPError) and exc.status_code == 404:
+                    delivery_error = "chat_not_found"
                 logger.warning(
                     "Job %s delivery failed (attempt %d): %r", job_id, attempts, exc
                 )
@@ -328,11 +348,31 @@ async def process_jobs(bot_client):
             async with session.begin():
                 record = await session.get(Job, job_id)
                 if record:
+                    if delivered_message_id is not None:
+                        await kopatych.record_assignment_delivery(session, payload, delivered_message_id)
+                    if kind == "message" and status == "failed":
+                        await kopatych.mark_admission_failed(session, bot_id, payload.get("message_id"))
+                    if delivery_error == "chat_not_found":
+                        await session.execute(update(Chat).where(
+                            Chat.bot_id == bot_id, Chat.chat_id == chat_id,
+                            Chat.user_huid == uuid.UUID(user_huid),
+                        ).values(available=False))
                     record.status = status
-                    if record.notification_token_id is not None:
-                        record.payload = {**payload, "delivery_error": delivery_error}
+                    if kind in {"notification", "assignment_event"}:
+                        record.payload = {
+                            **payload, "delivery_error": delivery_error,
+                            **({"delivered_at": datetime.now(timezone.utc).isoformat()} if status == "completed" else {}),
+                            **({"delivered_message_id": str(delivered_message_id)} if delivered_message_id is not None else {}),
+                        }
                     elif payload.get("retain_content") is False and status in {"completed", "failed"}:
-                        record.payload = {k: v for k, v in payload.items() if k not in {"text", "reply"}}
+                        record.payload = {k: v for k, v in payload.items() if k not in {"text", "reply", "sender_ad_login", "sender_ad_domain"}}
+                    if reply_to_log is not None:
+                        record.payload = {
+                            **record.payload, "bot_reply": True, "delivery_error": delivery_error,
+                            **({"delivery_text": reply_to_log} if payload.get("retain_content") is not False else {}),
+                            **({"delivered_at": datetime.now(timezone.utc).isoformat(),
+                                "delivered_message_id": str(reply_id)} if status == "completed" else {}),
+                        }
 
 
 ADMIN_SESSION_COOKIE = "gateway_admin_session"
@@ -708,6 +748,16 @@ async def update_internal_bot(internal_bot_id: uuid.UUID, req: InternalBotReques
         return internal_bot_info(record)
 
 
+@app.delete(_INTERNAL_BOTS_URL + "/{internal_bot_id}", dependencies=[Depends(authorized)], status_code=204)
+async def delete_internal_bot(internal_bot_id: uuid.UUID):
+    async with Session.begin() as session:
+        record = await session.get(InternalBot, internal_bot_id, with_for_update=True)
+        if record is None:
+            raise HTTPException(404, "Internal bot not found")
+        await session.delete(record)
+    return Response(status_code=204)
+
+
 class BotXBindingRequest(BaseModel):
     internal_bot_id: uuid.UUID | None
 
@@ -742,6 +792,16 @@ async def set_botx_secret_key(botx_id: uuid.UUID, req: BotXSecretKeyRequest):
 
     if connection.enabled and connection.cts_url:
         publish_botx_credentials(connection)
+
+
+@app.delete("/api/v1/admin/botx/{botx_id}", dependencies=[Depends(authorized)], status_code=204)
+async def delete_botx(botx_id: uuid.UUID):
+    async with Session.begin() as session:
+        connection = await session.get(Bot, botx_id, with_for_update=True)
+        if connection is None:
+            raise HTTPException(404, "BotX connection not found")
+        await session.delete(connection)
+    return Response(status_code=204)
 
 
 @app.put("/api/v1/admin/botx/{botx_id}", dependencies=[Depends(authorized)])
@@ -968,11 +1028,12 @@ class NotificationIntegrationRequest(BaseModel):
         if value is not None and len(str(value)) > 2048:
             raise ValueError("Длина адреса не должна превышать 2048 символов.")
         if value is not None and (
-            value.scheme != "https" or value.port != 443
-            or value.username is not None or value.password is not None
+            value.username is not None or value.password is not None
             or value.fragment is not None
         ):
-            raise ValueError("Укажите HTTPS-адрес на порту 443 без учётных данных и фрагмента.")
+            raise ValueError("Укажите адрес API без учётных данных и фрагмента.")
+        if value is not None and value.port == 0:
+            raise ValueError("Укажите порт от 1 до 65535.")
         return value
 
     @field_validator("name", "description", mode="before")
@@ -985,6 +1046,22 @@ class NotificationIntegrationRequest(BaseModel):
         return value
 
 
+class IntegrationAccessRequest(BaseModel):
+    outbound_auth_type: ExternalAuthType
+    outbound_token: SecretStr | None = None
+
+
+class IntegrationTokenRequest(BaseModel):
+    bot_id: uuid.UUID | None = None
+    purpose: Literal["notification", "assignment_events"] = "notification"
+
+    @model_validator(mode="after")
+    def validate_scope(self):
+        if self.purpose == "assignment_events" and self.bot_id is not None:
+            raise ValueError("Assignment event tokens are scoped to the external system")
+        return self
+
+
 def notification_token_digest(secret: str) -> str:
     return hashlib.sha256(secret.encode("utf-8")).hexdigest()
 
@@ -993,6 +1070,7 @@ def notification_token_info(token: NotificationToken) -> dict:
     return {
         "id": token.id,
         "bot_id": token.bot_id,
+        "purpose": token.purpose,
         "prefix": token.prefix,
         "created_at": token.created_at,
         "revoked_at": token.revoked_at,
@@ -1028,10 +1106,17 @@ async def list_notification_integrations():
     return list(result.values())
 
 
-async def issue_notification_token(session, integration_id: int):
+async def issue_notification_token(session, integration_id: int, scope: IntegrationTokenRequest):
+    if scope.bot_id is not None:
+        route = await session.get(
+            NotificationRoute, (integration_id, scope.bot_id),
+            with_for_update={"read": True, "key_share": True},
+        )
+        if route is None:
+            raise HTTPException(404, "Notification route not found")
     secret = "ntf_" + secrets.token_urlsafe(32)
     token = NotificationToken(
-        integration_id=integration_id,
+        integration_id=integration_id, bot_id=scope.bot_id, purpose=scope.purpose,
         digest=notification_token_digest(secret), prefix=secret[:12],
     )
     session.add(token)
@@ -1111,6 +1196,33 @@ async def update_notification_integration(integration_id: NotificationPathId, re
     return {"id": row.id}
 
 
+@app.patch(_INTEGRATIONS_URL + "/{integration_id}/access-token", dependencies=[Depends(authorized)], status_code=204)
+async def set_integration_access(integration_id: NotificationPathId, req: IntegrationAccessRequest):
+    token = req.outbound_token.get_secret_value() if req.outbound_token is not None else None
+    if req.outbound_auth_type == "none":
+        if token is not None:
+            raise HTTPException(422, "Токен не нужен для авторизации без токена.")
+    elif token is None or not 1 <= len(token) <= 4096 or any(not 33 <= ord(char) <= 126 for char in token):
+        raise HTTPException(422, "Укажите токен из 1–4096 печатных ASCII-символов без пробелов.")
+    async with Session.begin() as session:
+        row = await session.get(NotificationIntegration, integration_id, with_for_update=True)
+        if row is None:
+            raise HTTPException(404, "Внешняя система не найдена.")
+        row.outbound_auth_type = req.outbound_auth_type
+        row.outbound_token = token
+    return Response(status_code=204)
+
+
+@app.delete(_INTEGRATIONS_URL + "/{integration_id}", dependencies=[Depends(authorized)], status_code=204)
+async def delete_notification_integration(integration_id: NotificationPathId):
+    async with Session.begin() as session:
+        row = await session.get(NotificationIntegration, integration_id, with_for_update=True)
+        if row is None:
+            raise HTTPException(404, "Внешняя система не найдена.")
+        await session.delete(row)
+    return Response(status_code=204)
+
+
 @app.post(_INTEGRATIONS_URL + "/{integration_id}/check", dependencies=[Depends(authorized)])
 async def check_external_system(integration_id: NotificationPathId):
     async with Session() as session:
@@ -1118,18 +1230,20 @@ async def check_external_system(integration_id: NotificationPathId):
         if row is None:
             raise HTTPException(404, "Внешняя система не найдена.")
         if not row.outbound_url:
-            raise HTTPException(409, "Укажите HTTPS-адрес внешней системы.")
-        host = httpx.URL(row.outbound_url).raw_host.decode("ascii").strip("[]")
+            raise HTTPException(409, "Укажите адрес внешней системы.")
+        url = httpx.URL(row.outbound_url)
+        host = url.raw_host.decode("ascii").strip("[]")
+        port = url.port if url.port is not None else (443 if url.scheme == "https" else 80)
 
     try:
-        _, writer = await asyncio.wait_for(asyncio.open_connection(host, 443), timeout=5)
+        _, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=5)
         writer.close()
         await writer.wait_closed()
     except TimeoutError as exc:
-        raise HTTPException(504, "Истекло время ожидания подключения к TCP-порту 443.") from exc
+        raise HTTPException(504, f"Истекло время ожидания подключения к TCP-порту {port}.") from exc
     except OSError as exc:
-        raise HTTPException(502, "Не удалось подключиться к TCP-порту 443.") from exc
-    return {"status": "ok", "port": 443}
+        raise HTTPException(502, f"Не удалось подключиться к TCP-порту {port}.") from exc
+    return {"status": "ok", "port": port}
 
 
 @app.put(_INTEGRATIONS_URL + "/{integration_id}/routes/{bot_id}", dependencies=[Depends(authorized)])
@@ -1162,12 +1276,12 @@ async def delete_notification_route(integration_id: NotificationPathId, bot_id: 
 
 @app.post(_INTEGRATIONS_URL + "/{integration_id}/tokens", dependencies=[Depends(authorized)], status_code=201)
 async def create_notification_token(
-    integration_id: NotificationPathId, response: Response,
+    integration_id: NotificationPathId, response: Response, scope: IntegrationTokenRequest | None = None,
 ):
     async with Session.begin() as session:
-        if not await session.get(NotificationIntegration, integration_id):
+        if not await session.get(NotificationIntegration, integration_id, with_for_update=True):
             raise HTTPException(404, "Integration not found")
-        token = await issue_notification_token(session, integration_id)
+        token = await issue_notification_token(session, integration_id, scope or IntegrationTokenRequest())
     response.headers["Cache-Control"] = "no-store"
     return token
 
@@ -1191,21 +1305,45 @@ async def notification_integration_logs(
     async with Session() as session:
         if not await session.get(NotificationIntegration, integration_id):
             raise HTTPException(404, "Integration not found")
-        query = (
-            select(Job, NotificationToken.prefix, Bot.name)
-            .join(NotificationToken, Job.notification_token_id == NotificationToken.id)
-            .join(Bot, Job.bot_id == Bot.id)
-            .where(NotificationToken.integration_id == integration_id)
-            .order_by(Job.id.desc()).limit(51)
+        return await _delivery_logs(
+            session, before_id,
+            or_(NotificationToken.integration_id == integration_id,
+                Job.payload["external_system_id"].as_integer() == integration_id),
         )
-        if before_id is not None:
-            query = query.where(Job.id < before_id)
-        rows = (await session.execute(query)).all()
+
+
+@app.get("/api/v1/admin/botx/{bot_id}/logs", dependencies=[Depends(authorized)])
+async def botx_delivery_logs(
+    bot_id: uuid.UUID,
+    before_id: int | None = Query(default=None, ge=1, le=2_147_483_647),
+):
+    async with Session() as session:
+        if not await session.get(Bot, bot_id):
+            raise HTTPException(404, "BotX connection not found")
+        return await _delivery_logs(session, before_id, Job.bot_id == bot_id)
+
+
+async def _delivery_logs(session, before_id, scope):
+    query = (
+        select(Job, NotificationToken.prefix, Bot.name)
+        .outerjoin(NotificationToken, Job.notification_token_id == NotificationToken.id)
+        .join(Bot, Job.bot_id == Bot.id)
+        .where(scope, or_(Job.payload["kind"].as_string().in_(("notification", "assignment_event")),
+                          Job.payload["bot_reply"].as_boolean().is_(True)))
+        .order_by(Job.id.desc()).limit(51)
+    )
+    if before_id is not None:
+        query = query.where(Job.id < before_id)
+    rows = (await session.execute(query)).all()
     entries = [
         {
             "job_id": job.id, "bot_id": job.bot_id, "bot_name": bot_name, "chat_id": job.chat_id,
             "token_prefix": prefix, "created_at": job.created_at, "status": job.status,
             "attempts": job.attempts, "delivery_error": job.payload.get("delivery_error"),
+            "kind": job.payload["kind"], "event_kind": job.payload.get("event_kind"),
+            "text": job.payload.get("delivery_text", job.payload.get("text") if job.payload["kind"] == "notification" else None),
+            "delivered_at": job.payload.get("delivered_at"),
+            "delivered_message_id": job.payload.get("delivered_message_id"),
         }
         for job, prefix, bot_name in rows[:50]
     ]
@@ -1214,28 +1352,56 @@ async def notification_integration_logs(
 
 async def authorized_notification(
     request: Request,
-    x_notification_token: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_notification_token: str | None = Header(default=None, include_in_schema=False),
     x_admin_token: str | None = Header(default=None),
 ) -> NotificationToken | None:
-    if settings.notification_token and x_notification_token and _constant_time_equal(
-        x_notification_token, settings.notification_token
-    ):
+    api_key = x_api_key if x_api_key is not None else x_notification_token
+    if api_key and settings.notification_token and _constant_time_equal(api_key, settings.notification_token):
         return None
-    if x_notification_token and x_notification_token.startswith("ntf_"):
+    if api_key and api_key.startswith("ntf_"):
         async with Session() as session:
-            token = await session.scalar(select(NotificationToken).where(
-                NotificationToken.digest == notification_token_digest(x_notification_token),
-                NotificationToken.revoked_at.is_(None),
-            ))
-        if not token:
-            raise HTTPException(401, "Invalid notification token")
-        return token
-    await authorized(request, x_admin_token)
-    return None
+            token = await integration_token(session, api_key, "notification")
+        if token:
+            return token
+    elif x_api_key is None:
+        await authorized(request, x_admin_token)
+        return None
+    raise HTTPException(401, "Invalid notification API key")
+
+
+async def integration_token(session, secret: str, purpose: str) -> NotificationToken | None:
+    return await session.scalar(select(NotificationToken).where(
+        NotificationToken.digest == notification_token_digest(secret),
+        NotificationToken.revoked_at.is_(None),
+        NotificationToken.purpose == purpose,
+    ))
+
+
+@app.post("/api/v1/integrations/assignments/events", status_code=202)
+async def assignment_event(
+    event: kopatych.AssignmentCallback,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    authorization: str | None = Header(default=None, include_in_schema=False),
+    x_assignment_connector: str | None = Header(default=None),
+):
+    if x_api_key is None:
+        scheme, _, secret = (authorization or "").partition(" ")
+        if scheme.casefold() == "bearer":
+            x_api_key = secret
+    if (not x_api_key or not x_api_key.startswith("ntf_")
+            or x_assignment_connector != f"clouds:{settings.kopatych_connector_id}"):
+        raise HTTPException(401, "Invalid assignment event credentials")
+    async with Session.begin() as session:
+        token = await integration_token(session, x_api_key, "assignment_events")
+        if token is None:
+            raise HTTPException(401, "Invalid assignment event credentials")
+        await kopatych.enqueue_assignment_event(session, token.integration_id, event)
+    return {"status": "accepted"}
 
 
 class Notification(BaseModel):
-    bot_id: uuid.UUID
+    bot_id: uuid.UUID | None = None
     chat_id: uuid.UUID | None = None
     user_huid: uuid.UUID | None = None
     email: str | None = None
@@ -1282,42 +1448,21 @@ async def allows_notification(
     return not route.chat_ids or str(chat_id) in route.chat_ids
 
 
-async def personal_chat_for_user(session, bot_record: Bot, user_huid: uuid.UUID) -> uuid.UUID:
-    """Reuse the bot's personal chat with this user, or create it on CTS."""
-    for chat in await session.scalars(
-        select(Chat).where(Chat.bot_id == bot_record.id, Chat.chat_type == "personal")
-    ):
-        if (chat.settings or {}).get("user_huid") == str(user_huid):
-            return chat.chat_id
-    async with BotXClient(
-        bot_id=bot_record.id, cts_url=bot_record.cts_url, secret_key=bot_record.secret_key
-    ) as client:
-        try:
-            chat_id = await client.create_chat("Personal chat", "chat", [user_huid])
-        except BotXClientError as exc:
-            raise HTTPException(502, "Could not create a personal chat with this user on CTS") from exc
-    session.add(Chat(
-        bot_id=bot_record.id,
-        chat_id=chat_id,
-        chat_type="personal",
-        history_enabled=False,
-        settings={"user_huid": str(user_huid)},
-    ))
-    return chat_id
-
-
 @app.post("/api/v1/messages", status_code=202)
 @app.post("/api/v1/notifications", status_code=202)
 async def notification(req: Notification, token: NotificationToken | None = Depends(authorized_notification)):
     async with Session.begin() as session:
         user_targeted = req.email is not None or req.user_huid is not None
+        bot_id = req.bot_id or (token.bot_id if token else None)
+        if bot_id is None:
+            raise HTTPException(422, "bot_id is required unless the token is scoped to a BotX route")
         if token and not await allows_notification(
-            session, token, req.bot_id,
+            session, token, bot_id,
             None if user_targeted else req.chat_id,
             user_targeted=user_targeted,
         ):
             raise HTTPException(403, "System is not authorized to send to this BotX and chat")
-        record = await session.get(Bot, req.bot_id)
+        record = await session.get(Bot, bot_id)
         if not record or not record.enabled or not record.cts_url or not record.secret_key:
             raise HTTPException(404, "Bot not found or not connected")
         recipient_huid = req.user_huid
@@ -1330,14 +1475,17 @@ async def notification(req: Notification, token: NotificationToken | None = Depe
                 raise HTTPException(404, "User not found on this eXpress server")
             recipient_huid = botx_user_huid(resolved)
         if recipient_huid is not None:
-            target_chat_id = await personal_chat_for_user(session, record, recipient_huid)
+            try:
+                target_chat_id = await personal_chat_for_user(session, record, recipient_huid)
+            except BotXClientError as exc:
+                raise HTTPException(502, "Could not resolve a personal chat with this user on CTS") from exc
         else:
             target_chat_id = req.chat_id
         payload = {"text": req.text, "kind": "notification"}
         if recipient_huid is not None:
             payload["user_huid"] = str(recipient_huid)
         job = Job(
-            bot_id=req.bot_id,
+            bot_id=bot_id,
             chat_id=target_chat_id,
             payload=payload,
             notification_token_id=token.id if token else None,
@@ -1346,7 +1494,7 @@ async def notification(req: Notification, token: NotificationToken | None = Depe
         await session.flush()
         logger.info(
             "Notification job %s accepted for bot %s chat %s%s",
-            job.id, req.bot_id, target_chat_id,
+            job.id, bot_id, target_chat_id,
             f" (user {recipient_huid})" if recipient_huid is not None else "",
         )
     response = {"job_id": job.id, "status": job.status}

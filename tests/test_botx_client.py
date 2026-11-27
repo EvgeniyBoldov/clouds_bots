@@ -59,6 +59,19 @@ async def test_list_chats_returns_the_result_list():
     assert "Authorization" in request.headers
 
 
+async def test_find_personal_chat_returns_the_cts_address():
+    chat_id, user_huid = uuid4(), uuid4()
+    cts = CTS(json_body={"result": {"group_chat_id": str(chat_id)}})
+    async with make_client(cts) as client:
+        assert await client.find_personal_chat(user_huid) == chat_id
+    request, = cts.requests
+    assert request.url.path == "/api/v1/botx/chats/personal"
+    assert request.url.params["user_huid"] == str(user_huid)
+
+    async with make_client(CTS(status_code=404, json_body={})) as client:
+        assert await client.find_personal_chat(user_huid) is None
+
+
 async def test_each_request_carries_a_fresh_reference_shaped_jwt():
     cts = CTS(json_body={"result": []})
     async with make_client(cts) as client:

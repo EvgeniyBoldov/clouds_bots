@@ -133,6 +133,7 @@ h2 { margin: 0; font-size: 16px; font-weight: 650; letter-spacing: -.02em; }
 .data-main { display: grid; min-width: 0; gap: 5px; }
 .data-main strong { color: #34394d; font-size: 13px; font-weight: 600; overflow-wrap: anywhere; }
 .data-main small { color: #858b9d; font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; }
+.delivery-text { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
 .mono { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
 .status-tag { flex: 0 0 auto; border-radius: 18px; padding: 5px 9px; background: #ebf7ef; color: #398660; font-size: 11px; }
 .status-tag.disabled { background: #f3f4f8; color: #73788a; }

@@ -5,6 +5,7 @@ from fastapi import HTTPException
 from uuid import UUID
 
 from gateway.integrations import HandlerRequest, HandlerResult
+from gateway.kopatych import KopatychBot
 from gateway.templates import (
     BaseBot,
     EchoBot,
@@ -31,7 +32,8 @@ def test_echo_template_catalog_and_commands():
     entry = get_template("echo")
     assert entry is not None
     assert {item.name for item in entry.bot_class.command_catalog()} == {"/help", "/ping"}
-    assert {item["id"] for item in template_catalog()} == {"echo"}
+    assert {item["id"] for item in template_catalog()} == {"echo", "kopatych"}
+    assert get_template("kopatych").bot_class is KopatychBot
 
     assert asyncio.run(EchoBot().dispatch(request("/ping", "/ping"))).text == "pong"
     assert "Доступные команды" in asyncio.run(EchoBot().dispatch(request("/help", "/help"))).text

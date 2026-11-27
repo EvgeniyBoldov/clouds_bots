@@ -171,37 +171,37 @@
             <label class="field-label" for="integration-description">Назначение</label>
             <textarea id="integration-description" name="description" rows="3" maxlength="4000" required></textarea>
           </div>
+          <div class="form-field">
+            <label class="field-label" for="integration-outbound-url">Адрес API</label>
+            <input id="integration-outbound-url" name="outbound_url" type="url" maxlength="2048" placeholder="http://api.example.org:8080/v1/requests">
+          </div>
           <fieldset class="route-settings form-field-wide">
             <legend>Уведомления в BotX</legend>
             <div id="integration-routes" class="data-list"></div>
             <button class="button button-quiet" type="button" id="add-integration-route">Добавить BotX</button>
-          </fieldset>
-          <fieldset class="route-settings form-field-wide">
-            <legend>Запросы бота к внешней системе</legend>
-            <div class="form-field">
-              <label class="field-label" for="integration-outbound-url">HTTPS-адрес API</label>
-              <input id="integration-outbound-url" name="outbound_url" type="url" maxlength="2048" placeholder="https://api.example.org/v1/requests">
-            </div>
-            <div class="form-field">
-              <label class="field-label" for="integration-outbound-auth">Тип авторизации</label>
-              <select id="integration-outbound-auth" name="outbound_auth_type">
-                <option value="none">Без авторизации</option>
-                <option value="bearer">Bearer</option>
-                <option value="api_key">API-ключ (X-API-Key)</option>
-                <option value="token">Authorization: Token</option>
-                <option value="basic">Basic (Base64)</option>
-              </select>
-            </div>
-            <div class="form-field" id="integration-outbound-token-field" hidden>
-              <label class="field-label" for="integration-outbound-token">Токен внешней системы</label>
-              <input id="integration-outbound-token" name="outbound_token" type="password" maxlength="4096" autocomplete="new-password">
-            </div>
           </fieldset>
           <p class="create-error" role="alert" hidden></p>
           <div class="form-actions modal-actions">
             <button class="button button-quiet" type="button" data-close-dialog>Отмена</button>
             <button class="button button-primary" type="submit">Добавить систему</button>
           </div>
+        </form>
+      </dialog>
+      <dialog id="integration-access-dialog" class="panel create-dialog" aria-labelledby="integration-access-heading">
+        <div class="panel-heading"><div><h2 id="integration-access-heading">Токен доступа</h2></div></div>
+        <form id="integration-access-form" class="bot-form">
+          <div class="form-field"><label class="field-label" for="integration-access-auth">Тип авторизации</label>
+            <select id="integration-access-auth" name="outbound_auth_type" required>
+              <option value="none">Без авторизации</option><option value="bearer">Bearer</option>
+              <option value="api_key">API-ключ (X-API-Key)</option><option value="token">Authorization: Token</option>
+              <option value="basic">Basic (Base64)</option>
+            </select>
+          </div>
+          <div class="form-field"><label class="field-label" for="integration-access-token">Токен</label>
+            <input id="integration-access-token" name="outbound_token" type="password" maxlength="4096" autocomplete="new-password">
+          </div>
+          <p class="create-error" role="alert" hidden></p>
+          <div class="form-actions modal-actions"><button class="button button-quiet" type="button" data-close-dialog>Отмена</button><button class="button button-primary" type="submit">Сохранить</button></div>
         </form>
       </dialog>
       <dialog id="grant-dialog" class="panel create-dialog" aria-labelledby="grant-dialog-heading">
@@ -233,19 +233,19 @@
       <dialog id="token-dialog" class="panel create-dialog" aria-labelledby="token-dialog-heading">
         <div class="panel-heading">
           <div>
-            <h2 id="token-dialog-heading">Выпустить токен уведомлений</h2>
+            <h2 id="token-dialog-heading">Выпустить API-ключ для уведомлений</h2>
             <p id="token-system-name"></p>
           </div>
         </div>
-        <p class="field-help">Передавайте токен в заголовке <code>X-Notification-Token</code>. Полный токен можно скопировать сразу после выпуска.</p>
+        <p class="field-help">Передавайте API-ключ в заголовке <code>X-API-Key</code>. Полное значение ключа можно скопировать сразу после выпуска.</p>
         <div id="issued-token-result" class="form-field" hidden>
-          <label class="field-label" for="issued-token">Токен</label>
+          <label class="field-label" for="issued-token">API-ключ</label>
           <input id="issued-token" class="mono" readonly autocomplete="off">
         </div>
         <p id="token-dialog-message" class="message" role="status" aria-live="polite"></p>
         <div class="form-actions modal-actions token-actions">
           <button id="close-token-dialog" class="button button-quiet" type="button">Отмена</button>
-          <button id="confirm-issue-token" class="button button-primary" type="button">Выпустить токен</button>
+          <button id="confirm-issue-token" class="button button-primary" type="button">Выпустить ключ</button>
           <button id="copy-issued-token" class="button button-primary" type="button" hidden>Скопировать</button>
         </div>
       </dialog>
@@ -294,12 +294,12 @@
       <template id="help-integrations">
         <section>
           <h3>Запросить внешнее API из бота</h3>
-          <p>Сохраните HTTPS-адрес и настройки авторизации в карточке системы. Выберите эту систему в настройках внутреннего бота. Шаблон бота определяет, когда отправлять запрос и как обработать ответ.</p>
-          <p>Кнопка «Проверить связь» проверяет TCP-подключение шлюза к порту 443 сохранённого адреса.</p>
+          <p>Сохраните HTTP- или HTTPS-адрес и настройки авторизации в карточке системы. Выберите эту систему в настройках внутреннего бота. Шаблон бота определяет, когда отправлять запрос и как обработать ответ.</p>
+          <p>Кнопка «Проверить связь» проверяет TCP-подключение к порту из адреса. По умолчанию используется 80 для HTTP и 443 для HTTPS.</p>
         </section>
         <section>
           <h3>Отправить уведомление</h3>
-          <p>Выпустите токен для системы. Используйте адрес шлюза, доступный отправителю, UUID BotX из маршрута и UUID чата, в который бот может писать.</p>
+          <p>Выпустите API-ключ для системы. Используйте адрес шлюза, доступный отправителю, UUID BotX из маршрута и UUID чата, в который бот может писать.</p>
           <label class="field-label" data-help-integration hidden>Внешняя система для примера<select data-help-system></select></label>
           <label class="field-label" data-help-route hidden>BotX для примера<select data-help-bot></select></label>
           <p class="field-help" data-help-no-routes hidden>Добавьте маршрут через BotX в настройках системы перед отправкой.</p>
@@ -314,9 +314,9 @@
         <section>
           <h3>Проверить доставку</h3>
           <pre><code>curl -sS "$GATEWAY_URL/api/v1/messages/123" \
-  -H "X-Notification-Token: $INTEGRATION_TOKEN"</code></pre>
+  -H "X-API-Key: $INTEGRATION_API_KEY"</code></pre>
           <p>Подставьте полученный <code>job_id</code>. Ответ содержит <code>job_id</code>, <code>status</code> и <code>attempts</code>. <code>pending</code> означает ожидание, <code>processing</code> — отправку, <code>completed</code> — подтверждение от BotX, <code>failed</code> — неудачу после трёх попыток. Те же статусы видны в журнале системы.</p>
-          <p><code>401</code> — токен отсутствует, неверен или отозван. <code>403</code> — отправка через этот BotX или в этот чат не разрешена. <code>404</code> — подключение недоступно или задача недоступна для этого токена. <code>422</code> — неверный формат запроса.</p>
+          <p><code>401</code> — API-ключ отсутствует, неверен или отозван. <code>403</code> — отправка через этот BotX или в этот чат не разрешена. <code>404</code> — подключение или задача недоступны для этого API-ключа. <code>422</code> — неверный формат запроса.</p>
           <p>Пути <code>/api/v1/notifications</code> и <code>/api/v1/notifications/{job_id}</code> принимают тот же формат. Каждый POST создаёт отдельную задачу.</p>
         </section>
       </template>

@@ -177,11 +177,26 @@ class BotXClient:
         return result
 
     async def list_chats(self) -> list[dict]:
-        """GET /api/v3/botx/chats/list — used for the connection test."""
+        """GET /api/v3/botx/chats/list — list chats accessible to this bot."""
         result = self._result(await self._request("GET", "api/v3/botx/chats/list"), "chats/list")
         if not isinstance(result, list):
             raise BotXResponseError("BotX chats/list result must be a list")
         return result
+
+    async def find_personal_chat(self, user_huid: uuid.UUID) -> uuid.UUID | None:
+        path = "api/v1/botx/chats/personal"
+        payload = await self._request(
+            "GET", path, params={"user_huid": str(user_huid)}, not_found_ok=True,
+        )
+        if payload is None:
+            return None
+        result = self._result(payload, path)
+        try:
+            if isinstance(result, dict):
+                return uuid.UUID(str(result.get("group_chat_id")))
+        except ValueError:
+            pass
+        raise BotXResponseError("BotX personal chat result is missing a usable group_chat_id")
 
     async def find_user_by_email(self, email: str) -> dict | None:
         """GET /api/v3/botx/users/by_email — the user record, or None when CTS answers 404."""
