@@ -104,10 +104,15 @@ async def incoming_message(message: IncomingMessage, bot: Bot) -> None:
     is_mentioned = any(str(mention.entity_id) == str(bot_id) for mention in getattr(mentions, "contacts", ()))
     reply = message.reply
     is_reply_to_bot = bool(reply and str(reply.author_id) == str(bot_id))
-    chat_type = str(getattr(message.chat, "type", "unknown")).lower()
-    is_group = "group" in chat_type
+    from .chats import PERSONAL_TYPES, lock_chat, record_chat
+
+    raw_chat_type = str(getattr(message.chat, "type", "unknown")).lower()
+    personal = raw_chat_type in PERSONAL_TYPES
+    chat_type = "personal" if personal else "group"
+    is_group = not personal
+    user_huid = _identifier(message.sender.huid) if personal else None
     from .main import Session
-    from .models import Bot as BotRecord, Chat, InternalBot, Message, InboundEvent, Job, UserGrant
+    from .models import Bot as BotRecord, InternalBot, Message, InboundEvent, Job, UserGrant
     async with Session() as session:
         bot_record = await session.get(BotRecord, bot_id)
         if bot_record is None or not bot_record.enabled:
@@ -115,7 +120,7 @@ async def incoming_message(message: IncomingMessage, bot: Bot) -> None:
         internal_bot = await session.scalar(select(InternalBot).where(InternalBot.botx_id == bot_id))
         if internal_bot is None or (is_group and not internal_bot.groups_enabled):
             return
-        if not is_group:
+        if not is_group or internal_bot.template_id == "kopatych":
             grant_id = await session.scalar(
                 select(UserGrant.id)
                 .where(
@@ -127,14 +132,11 @@ async def incoming_message(message: IncomingMessage, bot: Bot) -> None:
             )
             if grant_id is None:
                 return
-        chat = await session.scalar(select(Chat).where(Chat.bot_id == bot_id, Chat.chat_id == chat_id))
-        if chat is None:
-            chat = Chat(bot_id=bot_id, chat_id=chat_id, chat_type=chat_type, history_enabled=True)
-            session.add(chat)
-            await session.flush()
+        await lock_chat(session, bot_id, user_huid or chat_id)
         prior = await session.scalar(select(InboundEvent).where(InboundEvent.bot_id == bot_id, InboundEvent.message_id == message_id))
         if prior:
             return
+        chat = await record_chat(session, bot_id, chat_id, chat_type, user_huid=user_huid)
         keep_history = chat.history_enabled and (not is_group or internal_bot.group_history_enabled)
         session.add(InboundEvent(bot_id=bot_id, message_id=message_id, chat_id=chat_id,
                                  payload={"sender_id": user_id, "chat_type": chat_type,
@@ -150,6 +152,9 @@ async def incoming_message(message: IncomingMessage, bot: Bot) -> None:
                     "internal_bot_id": str(internal_bot.id),
                     "retain_content": keep_history,
                     "message_id": message_id, "sender_id": user_id, "command": command,
+                    **({"sender_ad_login": getattr(message.sender, "ad_login", None),
+                        "sender_ad_domain": getattr(message.sender, "ad_domain", None)}
+                       if internal_bot.template_id == "kopatych" else {}),
                     "is_group": is_group, "is_mentioned": is_mentioned,
                     "is_reply_to_bot": is_reply_to_bot,
                     "reply": ({"author_id": str(reply.author_id), "message_id": str(reply.sync_id),

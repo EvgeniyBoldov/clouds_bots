@@ -20,9 +20,10 @@ class ExternalSystem:
         *,
         params: httpx.QueryParams | dict | None = None,
         json: object = None,
+        extra_headers: dict[str, str] | None = None,
     ) -> httpx.Response:
-        """Send a request to the configured HTTPS endpoint."""
-        headers = {}
+        """Send a request to the configured HTTP or HTTPS endpoint."""
+        headers = dict(extra_headers or {})
         if self.auth_type != "none":
             if self._token is None:
                 raise RuntimeError("External system token is missing")
@@ -50,6 +51,7 @@ class HandlerRequest:
     metadata: dict = field(default_factory=dict)
     context: list[dict] = field(default_factory=list)
     external_system: ExternalSystem | None = field(default=None, repr=False)
+    internal_bot_id: str | None = None
 
 
 @dataclass

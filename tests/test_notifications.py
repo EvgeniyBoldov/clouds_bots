@@ -11,7 +11,8 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.ext.compiler import compiles
 
-from gateway import main
+from gateway import chats, main
+from gateway.bot import incoming_message
 from gateway.botx_client import BotXConnectionError
 from gateway.models import (
     Base,
@@ -22,6 +23,7 @@ from gateway.models import (
     NotificationIntegration,
     NotificationRoute,
     NotificationToken,
+    UserGrant,
 )
 
 
@@ -40,7 +42,7 @@ async def test_notifications_are_queued_and_forwarded_after_incoming_jobs(monkey
 
     bot_id, chat_id, disabled_id = uuid4(), uuid4(), uuid4()
     payload = {"bot_id": str(bot_id), "chat_id": str(chat_id), "text": "Deploy finished\n"}
-    headers = {"X-Notification-Token": "notification-secret"}
+    headers = {"X-API-Key": "notification-secret"}
     url = "/api/v1/notifications"
 
     try:
@@ -124,6 +126,7 @@ class FakeBotXClient:
     users: ClassVar[dict] = {}
     created: ClassVar[list] = []
     failure: ClassVar[Exception | None] = None
+    personal: ClassVar[dict] = {}
 
     def __init__(self, **_kwargs) -> None:
         pass
@@ -146,6 +149,9 @@ class FakeBotXClient:
         FakeBotXClient.created.append((name, chat_type, tuple(members), chat_id))
         return chat_id
 
+    async def find_personal_chat(self, user_huid):
+        return self.personal.get(user_huid)
+
 
 async def test_notification_can_target_a_user(monkeypatch, tmp_path):
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'gateway.db'}")
@@ -153,10 +159,11 @@ async def test_notification_can_target_a_user(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "Session", sessions)
     monkeypatch.setattr(main.settings, "notification_token", "notification-secret")
     monkeypatch.setattr(main, "BotXClient", FakeBotXClient)
+    monkeypatch.setattr(chats, "BotXClient", FakeBotXClient)
 
     bot_id, user_huid, other_huid = uuid4(), uuid4(), uuid4()
     FakeBotXClient.users = {"user@example.org": {"user_huid": str(user_huid)}}
-    headers = {"X-Notification-Token": "notification-secret"}
+    headers = {"X-API-Key": "notification-secret"}
     url = "/api/v1/messages"
 
     try:
@@ -204,7 +211,7 @@ async def test_notification_can_target_a_user(monkeypatch, tmp_path):
                     select(Chat).where(Chat.bot_id == bot_id, Chat.chat_id == UUID(created_chat_id))
                 )
                 assert chat.chat_type == "personal"
-                assert chat.settings == {"user_huid": str(user_huid)}
+                assert chat.user_huid == user_huid
 
             again = await client.post(url, headers=headers, json={
                 "bot_id": str(bot_id), "email": "user@example.org", "text": "Second",
@@ -220,6 +227,15 @@ async def test_notification_can_target_a_user(monkeypatch, tmp_path):
             assert by_huid.json()["user_huid"] == str(other_huid)
             assert by_huid.json()["chat_id"] != created_chat_id
             assert len(FakeBotXClient.created) == 2
+
+            other_existing_user, existing_chat = uuid4(), uuid4()
+            monkeypatch.setattr(FakeBotXClient, "personal", {other_existing_user: existing_chat})
+            found = await client.post(url, headers=headers, json={
+                "bot_id": str(bot_id), "user_huid": str(other_existing_user), "text": "Reuse",
+            })
+            assert found.status_code == 202
+            assert found.json()["chat_id"] == str(existing_chat)
+            assert len(FakeBotXClient.created) == 2
     finally:
         FakeBotXClient.users, FakeBotXClient.created, FakeBotXClient.failure = {}, [], None
         await engine.dispose()
@@ -230,6 +246,7 @@ async def test_user_targeted_notifications_respect_route_allowlists(monkeypatch,
     sessions = async_sessionmaker(engine, expire_on_commit=False)
     monkeypatch.setattr(main, "Session", sessions)
     monkeypatch.setattr(main, "BotXClient", FakeBotXClient)
+    monkeypatch.setattr(chats, "BotXClient", FakeBotXClient)
 
     bot_id, user_huid = uuid4(), uuid4()
     FakeBotXClient.users = {"user@example.org": {"user_huid": str(user_huid)}}
@@ -245,7 +262,7 @@ async def test_user_targeted_notifications_respect_route_allowlists(monkeypatch,
             session.add(integration)
             await session.flush()
             session.add(NotificationToken(
-                integration_id=integration.id,
+                integration_id=integration.id, bot_id=bot_id,
                 digest=main.notification_token_digest(integration_token),
                 prefix="ntf_inte",
             ))
@@ -253,16 +270,24 @@ async def test_user_targeted_notifications_respect_route_allowlists(monkeypatch,
                 integration_id=integration.id, bot_id=bot_id, chat_ids=[],
             ))
 
-        headers = {"X-Notification-Token": integration_token}
+        headers = {"X-API-Key": integration_token}
         transport = httpx.ASGITransport(app=main.app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-            allowed = await client.post("/api/v1/messages", headers=headers, json={
-                "bot_id": str(bot_id), "email": "user@example.org", "text": "Allowed",
-            })
+            payload = {"email": "user@example.org", "text": "Allowed"}
+            allowed = await client.post("/api/v1/messages", headers=headers, json=payload)
             assert allowed.status_code == 202, allowed.text
-            status = await client.get(f"/api/v1/messages/{allowed.json()['job_id']}", headers=headers)
+            status_url = f"/api/v1/messages/{allowed.json()['job_id']}"
+            status = await client.get(status_url, headers=headers)
             assert status.status_code == 200
             assert status.json()["status"] == "pending"
+            legacy_headers = {"X-Notification-Token": integration_token}
+            assert (await client.get(status_url, headers=legacy_headers)).status_code == 200
+            assert (await client.post("/api/v1/messages", headers=legacy_headers, json=payload)).status_code == 202
+            assert (await client.get(status_url, headers=legacy_headers | {"X-API-Key": "wrong"})).status_code == 401
+            mismatch = await client.post("/api/v1/messages", headers=headers, json={
+                "bot_id": str(uuid4()), "email": "user@example.org", "text": "Denied",
+            })
+            assert mismatch.status_code == 403
 
         async with sessions.begin() as session:
             route = await session.get(NotificationRoute, (integration.id, bot_id))
@@ -279,4 +304,54 @@ async def test_user_targeted_notifications_respect_route_allowlists(monkeypatch,
             assert hidden.status_code == 404
     finally:
         FakeBotXClient.users, FakeBotXClient.created, FakeBotXClient.failure = {}, [], None
+        await engine.dispose()
+
+
+async def test_personal_notifications_reuse_inbound_chat_until_cts_removes_it(monkeypatch, tmp_path):
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'chats.db'}")
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    monkeypatch.setattr(main, "Session", sessions)
+    monkeypatch.setattr(main.settings, "notification_token", "notification-secret")
+    monkeypatch.setattr(chats, "BotXClient", FakeBotXClient)
+    monkeypatch.setattr(FakeBotXClient, "created", [])
+    lookup = AsyncMock(return_value=None)
+    monkeypatch.setattr(FakeBotXClient, "find_personal_chat", lookup)
+    monkeypatch.setattr(FakeBotXClient, "list_chats", AsyncMock(return_value=[]), raising=False)
+    bot_id, user_huid, chat_id = uuid4(), uuid4(), uuid4()
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        async with sessions.begin() as session:
+            bot = Bot(id=bot_id, name="BotX", cts_url="https://cts.test", secret_key="bot-secret")
+            handler = InternalBot(name="Handler", botx_id=bot_id)
+            session.add_all([bot, handler])
+            await session.flush()
+            session.add(UserGrant(internal_bot_id=handler.id, user_id=str(user_huid)))
+
+        await incoming_message(SimpleNamespace(
+            bot=SimpleNamespace(id=bot_id), chat=SimpleNamespace(id=chat_id, type="ChatTypes.PERSONAL_CHAT"),
+            sender=SimpleNamespace(huid=user_huid), sync_id=uuid4(), body="Входящее сообщение",
+            mentions=SimpleNamespace(contacts=[]), reply=None,
+        ), None)
+
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app), base_url="http://test") as client:
+            async def notify():
+                response = await client.post("/api/v1/notifications", headers={
+                    "X-API-Key": "notification-secret",
+                }, json={"bot_id": str(bot_id), "user_huid": str(user_huid), "text": "Уведомление"})
+                assert response.status_code == 202, response.text
+                return UUID(response.json()["chat_id"])
+
+            assert await notify() == chat_id
+            lookup.assert_not_awaited()
+            await chats.reconcile_chats(sessions, bot)
+            new_chat_id = await notify()
+            assert new_chat_id != chat_id and len(FakeBotXClient.created) == 1
+            lookup.assert_awaited_once_with(user_huid)
+
+        async with sessions() as session:
+            records = {chat.chat_id: chat for chat in await session.scalars(select(Chat))}
+            assert not records[chat_id].available and records[new_chat_id].available
+            assert records[chat_id].user_huid == records[new_chat_id].user_huid == user_huid
+    finally:
         await engine.dispose()
